@@ -1,0 +1,29 @@
+{
+  "name": "@mentu/bridge",
+  "version": "1.0.0",
+  "description": "Terminal bridge daemon for Mentu - executes commands from cloud",
+  "main": "dist/index.js",
+  "bin": {
+    "mentu-bridge": "./bin/mentu-bridge.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "npx ts-node src/index.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rashidazarang/mentu-bridge.git"
+  },
+  "author": "Rashid Azarang",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0",
+    "yaml": "^2.3.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2"
+  }
+}

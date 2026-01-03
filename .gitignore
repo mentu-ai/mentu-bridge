@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Test
+coverage/
+.nyc_output/
+
+# Local
+*.local
+*.sqlite
+*.db
+
+# Mentu - exclude ledger but keep manifest
+.mentu/ledger.jsonl
+.mentu/config.yaml
+.mentu/sync-state.json
+.mentu/.lock
