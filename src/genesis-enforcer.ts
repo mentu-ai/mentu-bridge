@@ -277,7 +277,7 @@ export class GenesisEnforcer {
   /**
    * Check if an operation is allowed for an actor.
    *
-   * @param actor - The actor identity (e.g., 'agent:bridge-daemon')
+   * @param actor - The actor identity (e.g., 'agent:executor')
    * @param operation - The operation to check (e.g., 'execute', 'capture', 'commit')
    * @param _context - Optional context for the operation (reserved for future use)
    * @returns Enforcement result with allowed status and violation details if denied

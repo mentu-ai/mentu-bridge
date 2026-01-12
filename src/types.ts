@@ -70,6 +70,16 @@ export interface Command {
   approval_status: ApprovalStatus;
   approved_at: string | null;
   approved_by: string | null;
+
+  // Worktree isolation
+  with_worktree?: boolean;         // Create worktree before spawn
+  commitment_id?: string;          // Commitment ID for worktree naming
+}
+
+export interface WorktreeEnv {
+  MENTU_COMMITMENT: string;
+  MENTU_WORKTREE: string;
+  MENTU_WORKSPACE: string;
 }
 
 export interface ApprovalEvent {

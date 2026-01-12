@@ -2,10 +2,19 @@ import { createClient, RealtimeChannel, SupabaseClient } from '@supabase/supabas
 import { spawn, ChildProcess } from 'child_process';
 import * as os from 'os';
 import * as fs from 'fs';
-import type { BridgeConfig, Command, ExecutionResult, MentuOperation } from './types.js';
+import type { BridgeConfig, Command, ExecutionResult, MentuOperation, WorktreeEnv } from './types.js';
 import { CommitmentScheduler, type ExecuteCommitmentEvent } from './scheduler.js';
 import { ApprovalHandler } from './approval.js';
 import { GenesisEnforcer } from './genesis-enforcer.js';
+import {
+  createWorktree,
+  worktreeExists,
+  buildWorktreeEnv,
+  isGitRepo,
+  getWorktreePath,
+} from './worktree.js';
+import { releaseExecutorLock } from './executor-lock.js';
+import { BugExecutor } from './bug-executor.js';
 
 export class BridgeDaemon {
   private config: BridgeConfig;
@@ -17,6 +26,7 @@ export class BridgeDaemon {
   private scheduler: CommitmentScheduler;
   private approvalHandler: ApprovalHandler;
   private enforcers: Map<string, GenesisEnforcer> = new Map();
+  private bugExecutor?: BugExecutor;
 
   constructor(config: BridgeConfig) {
     this.config = config;
@@ -51,7 +61,7 @@ export class BridgeDaemon {
     }
 
     // Determine actor: use command actor if available, otherwise default
-    const actor = 'agent:bridge-daemon';
+    const actor = 'agent:executor'; // Standardized actor for all executors (Beacon/Bridge)
 
     // Check if 'execute' operation is allowed
     const result = enforcer.check(actor, 'execute', { command });
@@ -136,6 +146,18 @@ export class BridgeDaemon {
     // Start commitment scheduler for due commitment polling
     this.scheduler.start();
 
+    // Start bug executor with beacon-parity features
+    const workspaceId = process.env.MENTU_WORKSPACE_ID || this.config.workspace.id;
+    const machineId = process.env.MENTU_MACHINE_ID || this.config.machine.id;
+
+    if (workspaceId) {
+      this.bugExecutor = new BugExecutor(this.supabase, workspaceId, machineId);
+      await this.bugExecutor.start();
+      this.log('[Daemon] Bug executor started (beacon-parity mode)');
+    } else {
+      this.log('[Daemon] MENTU_WORKSPACE_ID not set, bug executor disabled');
+    }
+
     this.log('Daemon running. Waiting for commands...');
 
     // Process any pending commands from before we started
@@ -192,22 +214,31 @@ export class BridgeDaemon {
   }
 
   private async registerMachine(): Promise<void> {
+    // Build machine registration data
+    const machineData: Record<string, unknown> = {
+      id: this.config.machine.id,
+      workspace_id: this.config.workspace.id,
+      name: this.config.machine.name,
+      hostname: os.hostname(),
+      agents_available: Object.keys(this.config.agents),
+      status: 'online',
+      last_seen_at: new Date().toISOString(),
+    };
+
+    // Only include user_id if it's a valid UUID
+    if (this.config.user?.id && this.config.user.id.length === 36) {
+      machineData.user_id = this.config.user.id;
+    }
+
     const { error } = await this.supabase
       .from('bridge_machines')
-      .upsert({
-        id: this.config.machine.id,
-        workspace_id: this.config.workspace.id,
-        user_id: this.config.user.id,
-        name: this.config.machine.name,
-        hostname: os.hostname(),
-        agents_available: Object.keys(this.config.agents),
-        status: 'online',
-        last_seen_at: new Date().toISOString(),
-      });
+      .upsert(machineData);
 
     if (error) {
-      this.log(`Failed to register machine: ${error.message}`);
-      throw error;
+      // Non-fatal: log warning and continue (singleton check already works)
+      this.log(`Warning: Failed to register machine: ${error.message}`);
+      this.log('Continuing without machine registration (commands will still execute)');
+      return;
     }
 
     this.log('Machine registered successfully');
@@ -496,6 +527,43 @@ export class BridgeDaemon {
     const agentConfig = this.config.agents[command.agent];
     const args = [...agentConfig.default_flags, ...command.flags, command.prompt];
 
+    // Determine execution directory and environment
+    let execDir = command.working_directory;
+    let worktreeEnv: WorktreeEnv | null = null;
+
+    // Handle worktree creation if requested
+    if (command.with_worktree && command.commitment_id) {
+      const workspacePath = command.working_directory;
+
+      // Only create worktree if directory is a git repo
+      if (isGitRepo(workspacePath)) {
+        try {
+          // Check if worktree already exists (from previous attempt or reopen)
+          if (worktreeExists(workspacePath, command.commitment_id)) {
+            execDir = getWorktreePath(workspacePath, command.commitment_id);
+            this.log(`Worktree already exists at ${execDir}`);
+          } else {
+            const worktree = createWorktree(workspacePath, command.commitment_id);
+            execDir = worktree.worktree_path;
+            this.log(`Created worktree at ${execDir} on branch ${worktree.worktree_branch}`);
+          }
+
+          // Build worktree environment variables
+          worktreeEnv = buildWorktreeEnv(
+            command.commitment_id,
+            execDir,
+            workspacePath
+          );
+          this.log(`Injecting env: MENTU_COMMITMENT=${worktreeEnv.MENTU_COMMITMENT}`);
+        } catch (err) {
+          this.log(`Failed to create worktree: ${err instanceof Error ? err.message : String(err)}`);
+          // Continue without worktree - fall back to original directory
+        }
+      } else {
+        this.log(`Worktree requested but ${workspacePath} is not a git repo`);
+      }
+    }
+
     // Update status to running
     await this.supabase
       .from('bridge_commands')
@@ -512,14 +580,29 @@ export class BridgeDaemon {
       let timedOut = false;
 
       this.log(`Spawning: ${agentConfig.path} ${args.join(' ')}`);
+      this.log(`  cwd: ${execDir}`);
+
+      // Merge worktree environment variables if available
+      // Include CLAUDE_CODE_OAUTH_TOKEN for Max subscription auth (preferred over API key)
+      const env = {
+        ...process.env,
+        ...(worktreeEnv || {}),
+        // Ensure OAuth token is passed to Claude CLI if set
+        ...(process.env.CLAUDE_CODE_OAUTH_TOKEN && {
+          CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+        }),
+      };
 
       const child = spawn(agentConfig.path, args, {
-        cwd: command.working_directory,
+        cwd: execDir,
         shell: false,
-        env: { ...process.env },
+        env,
       });
 
       this.currentProcess = child;
+
+      // Close stdin immediately - Claude Code waits for stdin if left open
+      child.stdin.end();
 
       // Timeout handler
       const timeoutMs = (command.timeout_seconds || this.config.execution.default_timeout_seconds) * 1000;
@@ -622,8 +705,16 @@ export class BridgeDaemon {
   async shutdown(): Promise<void> {
     this.log('Shutting down...');
 
+    // Release executor lock FIRST
+    releaseExecutorLock();
+
     // Stop scheduler
     this.scheduler.stop();
+
+    // Stop bug executor
+    if (this.bugExecutor) {
+      await this.bugExecutor.stop();
+    }
 
     // Dispose approval handler
     await this.approvalHandler.dispose();

@@ -1,0 +1,25 @@
+{
+  "version": "2.0",
+  "name": "AutonomousBugExecution-v1.0 (mentu-bridge)",
+  "tier": "T2",
+  "required_files": [
+    "src/craft-executor.ts",
+    "src/bug-executor.ts",
+    "src/prompt-builder.ts"
+  ],
+  "checks": {
+    "tsc": true,
+    "build": true,
+    "test": false
+  },
+  "mentu": {
+    "enabled": true,
+    "commitments": {
+      "mode": "dynamic",
+      "min_count": 1,
+      "require_closed": true,
+      "require_evidence": true
+    }
+  },
+  "max_iterations": 75
+}
