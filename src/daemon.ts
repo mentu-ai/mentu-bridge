@@ -374,21 +374,40 @@ export class BridgeDaemon {
       return;
     }
 
-    const { data: pendingCommands, error } = await this.supabase
+    // Query for pending commands
+    const { data: pendingCommands, error: pendingError } = await this.supabase
       .from('bridge_commands')
       .select('*')
       .in('workspace_id', workspaceIds)
       .eq('status', 'pending')
       .order('created_at', { ascending: true });
 
-    if (error) {
-      this.log(`Failed to fetch pending commands: ${error.message}`);
-      return;
+    if (pendingError) {
+      this.log(`Failed to fetch pending commands: ${pendingError.message}`);
     }
 
-    if (pendingCommands && pendingCommands.length > 0) {
-      this.log(`Found ${pendingCommands.length} pending commands`);
-      for (const command of pendingCommands) {
+    // Also query for orphaned claimed commands (claimed by this machine but not completed)
+    // These can happen after daemon restart
+    const { data: orphanedCommands, error: orphanedError } = await this.supabase
+      .from('bridge_commands')
+      .select('*')
+      .in('workspace_id', workspaceIds)
+      .eq('status', 'claimed')
+      .eq('claimed_by_machine_id', this.config.machine.id)
+      .order('created_at', { ascending: true });
+
+    if (orphanedError) {
+      this.log(`Failed to fetch orphaned commands: ${orphanedError.message}`);
+    }
+
+    const allCommands = [
+      ...(pendingCommands || []),
+      ...(orphanedCommands || [])
+    ];
+
+    if (allCommands.length > 0) {
+      this.log(`Found ${allCommands.length} commands (${pendingCommands?.length || 0} pending, ${orphanedCommands?.length || 0} orphaned)`);
+      for (const command of allCommands) {
         await this.handleCommand(command as Command);
       }
     }
