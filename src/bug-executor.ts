@@ -4,6 +4,8 @@
  * Ported from beacon/executor.rs for beacon-parity.
  * Integrates: realtime subscription, atomic claiming, genesis enforcement,
  * worktree isolation, and output streaming.
+ *
+ * v2.0: Multi-workspace support via genesis.key discovery
  */
 
 import { SupabaseClient } from "@supabase/supabase-js";
@@ -14,6 +16,9 @@ import { WorktreeManager } from "./worktree-manager.js";
 import { OutputStreamer } from "./output-streamer.js";
 import { CraftExecutor } from "./craft-executor.js";
 import { isCraftPrompt } from "./prompt-builder.js";
+import { writeBugContext } from './context-writer.js';
+import type { WorkspaceConfig } from "./types.js";
+import type { AuditOutput } from "./types/audit-output.js";
 
 export interface ExecutionResult {
   success: boolean;
@@ -23,6 +28,23 @@ export interface ExecutionResult {
   pr_url?: string;
   exit_code: number;
   output: string;
+  error?: string;
+  verification?: string;      // How success was verified
+  blocked_reason?: string;    // Why fix couldn't be completed (Frame 2)
+}
+
+
+/**
+ * Bug memory structure from operations table
+ */
+export interface BugMemory {
+  id: string;
+  op: string;  // 'capture' for memories
+  payload: {
+    body?: string;
+    kind?: string;
+    [key: string]: unknown;
+  };
 }
 
 /**
@@ -30,26 +52,112 @@ export interface ExecutionResult {
  */
 export class BugExecutor {
   private supabase: SupabaseClient;
-  private workspaceId: string;
+  private workspaces: WorkspaceConfig[];
+  private workspaceIds: string[];
   private machineId: string;
-  private realtimeSubscriber: RealtimeSubscriber;
+  private realtimeSubscribers: RealtimeSubscriber[] = [];
   private genesisEnforcer: GenesisEnforcer | null = null;
   private worktreeManager: WorktreeManager;
-  private craftExecutor: CraftExecutor;
+  private craftExecutors: Map<string, CraftExecutor> = new Map();
   private isProcessing = false;
   private processingQueue: BridgeCommand[] = [];
 
   constructor(
     supabase: SupabaseClient,
-    workspaceId: string,
+    workspaces: WorkspaceConfig[],
     machineId: string
   ) {
     this.supabase = supabase;
-    this.workspaceId = workspaceId;
+    this.workspaces = workspaces;
+    this.workspaceIds = workspaces.map(w => w.id);
     this.machineId = machineId;
-    this.realtimeSubscriber = new RealtimeSubscriber(supabase, workspaceId, machineId);
+
+    // Create realtime subscriber for each workspace
+    for (const workspace of workspaces) {
+      const subscriber = new RealtimeSubscriber(supabase, workspace.id, machineId);
+      this.realtimeSubscribers.push(subscriber);
+
+      // Create CraftExecutor per workspace
+      this.craftExecutors.set(workspace.id, new CraftExecutor(supabase, workspace.id));
+    }
+
     this.worktreeManager = new WorktreeManager();
-    this.craftExecutor = new CraftExecutor(supabase, workspaceId);
+  }
+
+  /**
+   * Get the CraftExecutor for a workspace
+   */
+  private getCraftExecutor(workspaceId: string): CraftExecutor {
+    let executor = this.craftExecutors.get(workspaceId);
+    if (!executor) {
+      executor = new CraftExecutor(this.supabase, workspaceId);
+      this.craftExecutors.set(workspaceId, executor);
+    }
+    return executor;
+  }
+
+  /**
+   * Get workspace config by ID
+   */
+  private getWorkspace(workspaceId: string): WorkspaceConfig | undefined {
+    return this.workspaces.find(w => w.id === workspaceId);
+  }
+
+  /**
+   * Resolve working directory for a workspace.
+   * Bug memories come from a specific workspace (e.g., WarrantyOS).
+   * Execution must happen in that workspace's directory.
+   */
+  private resolveWorkspaceDirectory(workspaceId: string): string | undefined {
+    const workspace = this.workspaces.find(w => w.id === workspaceId);
+    if (!workspace) {
+      console.warn(`[BugExecutor] Unknown workspace: ${workspaceId}`);
+      return undefined;
+    }
+    return workspace.directory;
+  }
+
+  /**
+   * Clean up stale commands on startup.
+   * Commands stuck in pending/claimed/running beyond their timeout are marked as timeout.
+   */
+  async cleanupStaleCommands(): Promise<void> {
+    const maxAgeHours = 4; // Commands older than 4 hours are stale
+
+    const { data: staleCommands, error } = await this.supabase
+      .from("bridge_commands")
+      .select("id, status, timeout_seconds, created_at")
+      .in("status", ["pending", "claimed", "running"])
+      .in("workspace_id", this.workspaceIds);
+
+    if (error) {
+      console.error("[BugExecutor] Error checking stale commands:", error);
+      return;
+    }
+
+    const now = new Date();
+    let cleanedCount = 0;
+
+    for (const cmd of staleCommands || []) {
+      const created = new Date(cmd.created_at);
+      const ageHours = (now.getTime() - created.getTime()) / (1000 * 60 * 60);
+      const maxAgeForCommand = Math.max(maxAgeHours, (cmd.timeout_seconds || 600) / 3600 * 2);
+
+      if (ageHours > maxAgeForCommand) {
+        await this.supabase
+          .from("bridge_commands")
+          .update({
+            status: "timeout",
+            error: `Stale command cleaned up after ${ageHours.toFixed(1)} hours`,
+            completed_at: new Date().toISOString()
+          })
+          .eq("id", cmd.id);
+        cleanedCount++;
+        console.log(`[BugExecutor] Cleaned stale command ${cmd.id} (${ageHours.toFixed(1)}h old)`);
+      }
+    }
+
+    console.log(`[BugExecutor] Stale cleanup complete: ${cleanedCount} commands marked timeout`);
   }
 
   /**
@@ -57,12 +165,16 @@ export class BugExecutor {
    */
   async start(): Promise<void> {
     console.log(`[BugExecutor] Starting with machineId: ${this.machineId}`);
+    console.log(`[BugExecutor] Watching ${this.workspaces.length} workspaces: ${this.workspaces.map(w => w.name).join(', ')}`);
 
-    // Set up event handler
-    this.realtimeSubscriber.onEvent((event) => this.handleRealtimeEvent(event));
+    // Clean up stale commands before starting (F003)
+    await this.cleanupStaleCommands();
 
-    // Subscribe to realtime changes
-    await this.realtimeSubscriber.subscribe();
+    // Set up event handler for each subscriber
+    for (const subscriber of this.realtimeSubscribers) {
+      subscriber.onEvent((event) => this.handleRealtimeEvent(event));
+      await subscriber.subscribe();
+    }
 
     // Also poll for any pending commands on startup
     await this.pollPendingCommands();
@@ -74,7 +186,9 @@ export class BugExecutor {
    * Stop the bug executor
    */
   async stop(): Promise<void> {
-    await this.realtimeSubscriber.unsubscribe();
+    for (const subscriber of this.realtimeSubscribers) {
+      await subscriber.unsubscribe();
+    }
     if (this.genesisEnforcer) {
       this.genesisEnforcer.dispose();
     }
@@ -151,10 +265,15 @@ export class BugExecutor {
   private async pollPendingCommands(): Promise<void> {
     console.log("[BugExecutor] Polling for pending commands");
 
+    if (this.workspaceIds.length === 0) {
+      console.log("[BugExecutor] No workspace IDs to poll");
+      return;
+    }
+
     const { data, error } = await this.supabase
       .from("bridge_commands")
       .select("*")
-      .eq("workspace_id", this.workspaceId)
+      .in("workspace_id", this.workspaceIds)
       .eq("status", "pending")
       .order("created_at", { ascending: true })
       .limit(10);
@@ -164,6 +283,7 @@ export class BugExecutor {
       return;
     }
 
+    console.log(`[BugExecutor] Found ${data?.length || 0} pending commands`);
     for (const command of data || []) {
       this.queueCommand(command as BridgeCommand);
     }
@@ -174,7 +294,7 @@ export class BugExecutor {
    */
   private async executeCommand(command: BridgeCommand): Promise<void> {
     const commandId = command.id;
-    console.log(`[BugExecutor] Processing command ${commandId}`);
+    console.log(`[BugExecutor] Processing command ${commandId} (type: ${command.command_type || 'spawn'})`);
 
     // Step 1: Atomic claim
     const claimed = await this.claimCommand(commandId);
@@ -216,25 +336,33 @@ export class BugExecutor {
       // Update status to running
       await this.updateCommandStatus(commandId, 'running');
 
-      // Step 4: Execute with output streaming
-      const streamer = new OutputStreamer(this.supabase, commandId, this.workspaceId);
-      streamer.start();
+      // Step 4: Execute based on command_type
+      let result: ExecutionResult;
 
-      try {
-        const result = await this.runClaudeCommand(command, execDir, streamer);
+      if (command.command_type === 'bug_execution') {
+        // Use Architect+Auditor+Executor pattern for bug execution
+        console.log(`[BugExecutor] Using Architect+Auditor pattern for bug_execution`);
+        result = await this.executeBugCommand(command);
+      } else {
+        // Standard execution with output streaming
+        const streamer = new OutputStreamer(this.supabase, commandId, command.workspace_id);
+        streamer.start();
 
-        // Step 5: Update command with result
-        await this.completeCommand(commandId, result);
-        console.log(`[BugExecutor] Completed ${commandId} - success: ${result.success}`);
-
-        // Step 6: Capture evidence and close commitment (if linked)
-        if (command.commitment_id) {
-          const evidenceId = await this.captureEvidence(command.commitment_id, result);
-          await this.closeCommitment(command.commitment_id, evidenceId, result.success);
+        try {
+          result = await this.runClaudeCommand(command, execDir, streamer);
+        } finally {
+          await streamer.stop();
         }
+      }
 
-      } finally {
-        await streamer.stop();
+      // Step 5: Update command with result
+      await this.completeCommand(commandId, result);
+      console.log(`[BugExecutor] Completed ${commandId} - success: ${result.success}`);
+
+      // Step 6: Capture evidence and close commitment (if linked)
+      if (command.commitment_id) {
+        const evidenceId = await this.captureEvidence(command.workspace_id, command.commitment_id, result);
+        await this.closeCommitment(command.workspace_id, command.commitment_id, evidenceId, result.success);
       }
 
     } catch (error) {
@@ -242,7 +370,7 @@ export class BugExecutor {
       await this.failCommand(commandId, (error as Error).message);
 
       if (command.commitment_id) {
-        await this.handleCommitmentFailure(command.commitment_id, error as Error);
+        await this.handleCommitmentFailure(command.workspace_id, command.commitment_id, error as Error);
       }
     } finally {
       // Cleanup genesis enforcer
@@ -335,12 +463,14 @@ export class BugExecutor {
     if (isCraftPrompt(command.prompt) && command.commitment_id) {
       console.log(`[BugExecutor] Detected /craft command, using CraftExecutor`);
 
-      const craftResult = await this.craftExecutor.execute(
+      const craftExecutor = this.getCraftExecutor(command.workspace_id);
+      const craftResult = await craftExecutor.execute(
         command.prompt,
         execDir,
         command.commitment_id,
         streamer,
-        command.timeout_seconds || 3600
+        command.timeout_seconds || 3600,
+        command.id  // Pass command ID for spawn_logs correlation
       );
 
       return {
@@ -370,7 +500,10 @@ export class BugExecutor {
       const proc = spawn("claude", args, {
         cwd: execDir,
         timeout: (command.timeout_seconds || 600) * 1000,
-        env: { ...process.env }
+        env: {
+          ...process.env,
+          MENTU_BRIDGE_COMMAND_ID: command.id,
+        }
       });
 
       let stdout = "";
@@ -437,63 +570,664 @@ export class BugExecutor {
   /**
    * Capture execution evidence
    */
-  private async captureEvidence(commitmentId: string, result: ExecutionResult): Promise<string> {
+  private async captureEvidence(workspaceId: string, commitmentId: string, result: ExecutionResult): Promise<string> {
+    const evidenceId = `mem_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     const { data, error } = await this.supabase.from("operations").insert({
-      type: "capture",
+      id: evidenceId,
+      op: "capture",
+      ts: new Date().toISOString(),
+      actor: "agent:bridge-executor",
       payload: {
         kind: "execution-result",
         body: `Bug fix execution completed.\n\nSuccess: ${result.success}\nSummary: ${result.summary}\nFiles: ${result.files_changed.join(", ") || "none"}\nTests: ${result.tests_passed}`,
         result: result,
         refs: [commitmentId]
       },
-      workspace_id: this.workspaceId
+      workspace_id: workspaceId
     }).select("id").single();
 
-    if (error || !data) {
+    if (error) {
       throw new Error(`Failed to capture evidence: ${error?.message}`);
     }
 
-    return data.id;
+    return evidenceId;
   }
 
   /**
    * Close a commitment with evidence
    */
-  private async closeCommitment(commitmentId: string, evidenceId: string, success: boolean): Promise<void> {
+  private async closeCommitment(workspaceId: string, commitmentId: string, evidenceId: string, success: boolean): Promise<void> {
+    const closeId = `op_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     await this.supabase.from("operations").insert({
-      type: "close",
+      id: closeId,
+      op: "close",
+      ts: new Date().toISOString(),
+      actor: "agent:bridge-executor",
       payload: {
         target: commitmentId,
         evidence: evidenceId,
         outcome: success ? "completed" : "failed"
       },
-      workspace_id: this.workspaceId
+      workspace_id: workspaceId
     });
   }
 
   /**
    * Handle commitment failure (annotate + release)
    */
-  private async handleCommitmentFailure(commitmentId: string, error: Error): Promise<void> {
+  private async handleCommitmentFailure(workspaceId: string, commitmentId: string, error: Error): Promise<void> {
     // Annotate with failure
+    const annotateId = `op_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     await this.supabase.from("operations").insert({
-      type: "annotate",
+      id: annotateId,
+      op: "annotate",
+      ts: new Date().toISOString(),
+      actor: "agent:bridge-executor",
       payload: {
         target: commitmentId,
         body: `Execution failed: ${error.message}`,
         kind: "execution-failure"
       },
-      workspace_id: this.workspaceId
+      workspace_id: workspaceId
     });
 
     // Release claim
+    const releaseId = `op_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
     await this.supabase.from("operations").insert({
-      type: "release",
+      id: releaseId,
+      op: "release",
+      ts: new Date().toISOString(),
+      actor: "agent:bridge-executor",
       payload: {
         target: commitmentId,
         reason: error.message
       },
-      workspace_id: this.workspaceId
+      workspace_id: workspaceId
+    });
+  }
+
+  /**
+   * Fetch bug memory from operations table
+   */
+  private async fetchBugMemory(workspaceId: string, memoryId: string): Promise<BugMemory | null> {
+    const { data, error } = await this.supabase
+      .from("operations")
+      .select("id, op, payload")
+      .eq("id", memoryId)
+      .eq("workspace_id", workspaceId)
+      .single();
+
+    if (error || !data) {
+      console.error(`[BugExecutor] Failed to fetch memory ${memoryId}:`, error);
+      return null;
+    }
+
+    return data as BugMemory;
+  }
+
+  /**
+   * Extract essential bug info to minimize context window usage.
+   *
+   * Instead of passing the entire bug payload (~7000 tokens), extract only:
+   * - Description (first paragraph, max 500 chars)
+   * - Page URL
+   * - Element targeted
+   * - Screenshot URL
+   * - Summary stats
+   *
+   * Full diagnostic data remains available via memory ID if needed.
+   */
+  private extractEssentialBugInfo(bugMemory: BugMemory): string {
+    const payload = bugMemory.payload || {};
+    const body = (payload.body as string) || '';
+    const meta = (payload.meta as Record<string, unknown>) || {};
+
+    // Extract just the description (before "---" separator or first 500 chars)
+    const description = body.split('---')[0]?.trim().slice(0, 500) || body.slice(0, 500);
+
+    // Build minimal context (~300 tokens instead of ~7000)
+    return `## Bug Report
+
+**Description**: ${description}
+
+**Page**: ${meta.page_url || 'Unknown'}
+**Element**: ${meta.element_text || 'Not specified'} (${meta.element_tag || 'unknown'})
+**Screenshot**: ${meta.screenshot_url || 'None'}
+
+**Stats**: ${meta.console_error_count || 0} errors, ${meta.behavior_event_count || 0} user actions recorded
+
+Note: Full diagnostic data available in memory ${bugMemory.id} if needed.`;
+  }
+
+  /**
+   * Craft audit boundaries via the Auditor role.
+   *
+   * The Auditor analyzes the bug and produces BOUNDARIES, not steps.
+   * The Executor will decide HOW to fix within these boundaries.
+   */
+  private async craftAudit(bugMemory: BugMemory, workingDirectory: string): Promise<AuditOutput> {
+    const bugContent = this.extractEssentialBugInfo(bugMemory);
+    console.log(`[BugExecutor] Extracted bug info (${bugContent.length} chars):`);
+    console.log(bugContent);
+
+    const prompt = `You are the AUDITOR for a bug fix.
+
+## Your Role (from Dual Triad)
+- You CANNOT create vision (the bug report is the Architect's intent)
+- You CAN see everything (codebase, history, context)
+- Your job: Define BOUNDARIES for the Executor, NOT steps
+
+## Bug Report
+${bugContent}
+
+## Working Directory
+${workingDirectory}
+
+## Your Task
+1. Analyze the bug - what do you believe is broken?
+2. Identify likely files involved
+3. Define BOUNDARIES for the Executor:
+   - Objective: What does "fixed" look like?
+   - Scope: What files CAN and CANNOT be modified?
+   - Constraints: What MUST NOT happen?
+   - Success criteria: How to verify it works?
+
+## CRITICAL RULES
+- Do NOT output steps or instructions
+- Do NOT tell the Executor what to do step-by-step
+- The Executor has tools (Read, Edit, Bash, Grep) and will decide how to use them
+- You define the GOAL and BOUNDARIES, the Executor figures out the PATH
+
+## Output Format
+Return ONLY this JSON (no markdown, no explanation):
+{
+  "context": {
+    "hypothesis": "What you believe is broken",
+    "likely_files": ["path/to/file1.ts", "path/to/file2.ts"],
+    "confidence": 0.8
+  },
+  "audit": {
+    "objective": "Clear statement of what 'fixed' means",
+    "scope": {
+      "allowed_patterns": ["src/**/*.ts", "src/**/*.tsx"],
+      "forbidden_patterns": ["*.config.*", "package.json", "*.lock"],
+      "max_file_changes": 5
+    },
+    "constraints": [
+      "Must NOT break existing tests",
+      "Must NOT add new dependencies",
+      "Must NOT modify database schema"
+    ],
+    "success_criteria": [
+      "The specific bug behavior no longer occurs",
+      "Existing tests continue to pass",
+      "TypeScript compiles without errors"
+    ]
+  }
+}`;
+
+    console.log(`[BugExecutor] Calling Auditor (prompt: ${prompt.length} chars)...`);
+    const startTime = Date.now();
+    const output = await this.callClaudeSimple(prompt, workingDirectory, 180_000); // 3 min for complex analysis
+    console.log(`[BugExecutor] Auditor completed in ${Date.now() - startTime}ms`);
+    console.log(`[BugExecutor] Auditor raw output (first 500 chars): ${output.slice(0, 500)}`);
+
+    const jsonMatch = output.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.error(`[BugExecutor] No JSON found in output. Full output: ${output}`);
+      throw new Error("No JSON found in auditor output");
+    }
+    return JSON.parse(jsonMatch[0]) as AuditOutput;
+  }
+
+  /**
+   * Spawn the Executor with bounded scope.
+   *
+   * The Executor receives:
+   * - Objective (what to achieve)
+   * - Context (hypothesis, likely files)
+   * - Scope boundaries (allowed/forbidden patterns)
+   * - Constraints (what must NOT happen)
+   * - Success criteria (how to verify)
+   *
+   * The Executor has tools (Read, Edit, Bash, Grep, Glob) and DECIDES which to use.
+   * NO prescriptive steps. NO "1. Do this, 2. Do that".
+   */
+  private async spawnExecutor(
+    audit: AuditOutput,
+    workingDirectory: string,
+    timeoutSeconds: number
+  ): Promise<ExecutionResult> {
+    const executorPrompt = `You are the EXECUTOR fixing a bug.
+
+## Your Role (from Dual Triad)
+- You have FULL filesystem access within scope
+- You DECIDE which tools to use (Read, Edit, Bash, Grep, Glob)
+- You are BOUNDED by the Auditor's scope - do not exceed it
+- You figure out HOW to achieve the objective
+
+## Objective
+${audit.audit.objective}
+
+## Context from Auditor
+Hypothesis: ${audit.context.hypothesis}
+Likely relevant files: ${audit.context.likely_files.join(", ")}
+Confidence: ${audit.context.confidence}
+
+## Scope Boundaries (MUST RESPECT)
+- Allowed to modify: ${audit.audit.scope.allowed_patterns.join(", ")}
+- FORBIDDEN to touch: ${audit.audit.scope.forbidden_patterns.join(", ")}
+- Maximum files to change: ${audit.audit.scope.max_file_changes}
+
+## Constraints (MUST NOT VIOLATE)
+${audit.audit.constraints.map(c => `- ${c}`).join("\n")}
+
+## Success Criteria (HOW TO VERIFY)
+${audit.audit.success_criteria.map(c => `- ${c}`).join("\n")}
+
+## Your Tools
+You have: Read, Edit, Bash, Grep, Glob
+Use them as YOU decide. There are no prescribed steps.
+
+## When Complete
+Output ONLY this JSON:
+{
+  "success": true,
+  "summary": "Brief description of what you did",
+  "files_changed": ["file1.ts", "file2.ts"],
+  "verification": "How you verified success criteria were met",
+  "tests_passed": true
+}
+
+If you cannot fix within scope, output:
+{
+  "success": false,
+  "summary": "Why the fix is not possible within scope",
+  "files_changed": [],
+  "verification": "What was attempted",
+  "tests_passed": false,
+  "blocked_reason": "Explanation"
+}`;
+
+    const output = await this.callClaude(
+      executorPrompt,
+      workingDirectory,
+      timeoutSeconds * 1000
+    );
+
+    const jsonMatch = output.match(/\{[\s\S]*\}/);
+    if (jsonMatch) {
+      try {
+        const parsed = JSON.parse(jsonMatch[0]);
+        return {
+          success: parsed.success ?? false,
+          summary: parsed.summary ?? output.slice(-500),
+          files_changed: parsed.files_changed ?? [],
+          verification: parsed.verification ?? "Not provided",
+          tests_passed: parsed.tests_passed ?? false,
+          pr_url: parsed.pr_url,
+          blocked_reason: parsed.blocked_reason,  // Frame 2: Capture why fix couldn't complete
+          exit_code: parsed.success ? 0 : 1,
+          output: output
+        };
+      } catch {
+        // Fall through to default
+      }
+    }
+
+    return {
+      success: false,
+      summary: `Output unparseable: ${output.slice(-500)}`,
+      files_changed: [],
+      verification: "Parse failed",
+      tests_passed: false,
+      blocked_reason: "Output parse failed",  // Frame 2: Indicate failure reason
+      exit_code: 1,
+      output: output,
+      error: "Output parse failed"
+    };
+  }
+
+  /**
+   * Log scope compliance (advisory - does not block execution)
+   * Frame 2: Trust but verify. Log what happens.
+   */
+  private logScopeCompliance(audit: AuditOutput, result: ExecutionResult): void {
+    const { forbidden_patterns, max_file_changes } = audit.audit.scope;
+
+    // Log file count vs limit
+    if (result.files_changed.length > max_file_changes) {
+      console.warn(`[BugExecutor] SCOPE WARNING: Changed ${result.files_changed.length} files (limit: ${max_file_changes})`);
+    }
+
+    // Log forbidden pattern matches (advisory)
+    for (const file of result.files_changed) {
+      for (const pattern of forbidden_patterns) {
+        // Simple string match for v1.0 (full minimatch for v2.0)
+        const patternBase = pattern.replace(/\*/g, '');
+        if (patternBase && file.includes(patternBase)) {
+          console.warn(`[BugExecutor] SCOPE WARNING: ${file} may match forbidden pattern ${pattern}`);
+        }
+      }
+    }
+
+    console.log(`[BugExecutor] Scope compliance logged: ${result.files_changed.length} files changed`);
+  }
+
+  /**
+   * Call Claude CLI in headless mode with tools enabled.
+   * IMPORTANT: shell: true is required for Claude to work properly via spawn.
+   */
+  private callClaude(prompt: string, cwd: string, timeoutMs: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      // Escape prompt for shell safety
+      const escapedPrompt = prompt.replace(/'/g, "'\\''");
+      const proc = spawn("claude", [
+        "--dangerously-skip-permissions",
+        "--max-turns", "30",
+        "-p", `'${escapedPrompt}'`
+      ], {
+        cwd,
+        timeout: timeoutMs,
+        shell: true,
+        env: { ...process.env }
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      proc.stdout.on("data", (data) => { stdout += data.toString(); });
+      proc.stderr.on("data", (data) => { stderr += data.toString(); });
+
+      proc.on("close", (code) => {
+        if (code !== 0 && !stdout) {
+          reject(new Error(`Claude exited ${code}: ${stderr}`));
+        } else {
+          resolve(stdout);
+        }
+      });
+
+      proc.on("error", reject);
+    });
+  }
+
+  /**
+   * Call Claude CLI for simple JSON output.
+   * Uses --max-turns 20 to allow codebase exploration before JSON response.
+   * IMPORTANT: shell: true is required for Claude to work properly via spawn.
+   */
+  private callClaudeSimple(prompt: string, cwd: string, timeoutMs: number): Promise<string> {
+    return new Promise((resolve, reject) => {
+      // Escape prompt for shell safety
+      const escapedPrompt = prompt.replace(/'/g, "'\\''");
+      const proc = spawn("claude", [
+        "--dangerously-skip-permissions",
+        "--max-turns", "20",
+        "-p", `'${escapedPrompt}'`
+      ], {
+        cwd,
+        timeout: timeoutMs,
+        shell: true,
+        env: { ...process.env }
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      proc.stdout.on("data", (data) => { stdout += data.toString(); });
+      proc.stderr.on("data", (data) => { stderr += data.toString(); });
+
+      proc.on("close", (code) => {
+        if (code !== 0 && !stdout) {
+          reject(new Error(`Claude exited ${code}: ${stderr}`));
+        } else {
+          resolve(stdout);
+        }
+      });
+
+      proc.on("error", reject);
+    });
+  }
+
+  /**
+   * Execute a bug_execution command using terminal-based Claude spawning.
+   *
+   * ARCHITECTURE CHANGE (v2.0):
+   * - Bridge is INFRASTRUCTURE only (no ledger operations)
+   * - Claude is the ACTOR (claims, captures, closes)
+   * - Auditor still runs headless for boundary analysis
+   * - Executor spawns in terminal mode with mentu CLI access
+   */
+  async executeBugCommand(command: BridgeCommand & { payload?: { memory_id?: string; commitment_id?: string; timeout_seconds?: number } }): Promise<ExecutionResult> {
+    const payload = command.payload || {};
+    const memoryId = payload.memory_id;
+    const commitmentId = command.commitment_id || payload.commitment_id;
+    const timeoutSeconds = payload.timeout_seconds || command.timeout_seconds || 3600;
+
+    // CRITICAL FIX: Use command.working_directory directly
+    // Do NOT use resolveWorkspaceDirectory() which overrides with workspace config
+    const workingDirectory = command.working_directory;
+    console.log(`[BugExecutor] Using command working_directory: ${workingDirectory}`);
+
+    if (!memoryId) {
+      throw new Error("Bug execution requires payload.memory_id");
+    }
+
+    if (!commitmentId) {
+      throw new Error("Bug execution requires commitment_id");
+    }
+
+    // Step 1: Fetch bug memory
+    console.log(`[BugExecutor] Fetching bug memory ${memoryId}`);
+    const bugMemory = await this.fetchBugMemory(command.workspace_id, memoryId);
+    if (!bugMemory) {
+      throw new Error(`Bug memory ${memoryId} not found`);
+    }
+
+    // Step 2: Auditor - craft scoped boundaries (still headless, returns JSON)
+    console.log(`[BugExecutor] Crafting audit boundaries via Auditor`);
+    const audit = await this.craftAudit(bugMemory, workingDirectory);
+    console.log(`[BugExecutor] Auditor hypothesis: ${audit.context.hypothesis}`);
+
+    // Step 3: Write context file for Claude to read
+    console.log(`[BugExecutor] Writing bug context file`);
+    const contextPath = await writeBugContext({
+      commitmentId,
+      audit,
+      workingDirectory
+    });
+    console.log(`[BugExecutor] Context written to: ${contextPath}`);
+
+    // Step 4: Build API config for Claude to use
+    const apiConfig = {
+      proxyUrl: process.env.MENTU_API_URL || 'https://mentu-proxy.affihub.workers.dev',
+      apiKey: process.env.MENTU_PROXY_TOKEN || '',
+    };
+
+    if (!apiConfig.apiKey) {
+      console.warn(`[BugExecutor] Warning: MENTU_PROXY_TOKEN not set, API calls may fail`);
+    }
+
+    // Step 5: Spawn Claude in terminal mode
+    // Claude will claim, fix, capture evidence, and close
+    console.log(`[BugExecutor] Spawning terminal executor in ${workingDirectory}`);
+    const result = await this.spawnTerminalExecutor(
+      workingDirectory,
+      commitmentId,
+      timeoutSeconds,
+      command.id,
+      command.workspace_id,
+      apiConfig
+    );
+
+    // Step 6: Store result in bridge_commands.result
+    const { error: updateError } = await this.supabase
+      .from("bridge_commands")
+      .update({ result: { audit, execution: result } })
+      .eq("id", command.id)
+      .select();
+
+    if (updateError) {
+      console.error(`[BugExecutor] Failed to store result for ${command.id}:`, updateError);
+    } else {
+      console.log(`[BugExecutor] Result stored for ${command.id}`);
+    }
+
+    // NOTE: Bridge does NOT claim or close
+    // Claude is expected to do this via mentu CLI
+    return result;
+  }
+
+  /**
+   * Build the prompt for the executor with API instructions.
+   * This provides both mentu CLI env vars AND curl fallback commands.
+   */
+  private buildExecutorPrompt(
+    commitmentId: string,
+    apiConfig: { proxyUrl: string; apiKey: string }
+  ): string {
+    return `You are fixing a bug for commitment ${commitmentId}.
+
+Read .mentu/bug-context.md for full instructions.
+
+## Mentu API
+
+**Base URL**: ${apiConfig.proxyUrl}
+**Auth Header**: X-Proxy-Token: ${apiConfig.apiKey}
+
+### 1. Claim Commitment (FIRST)
+\`\`\`bash
+curl -X POST "${apiConfig.proxyUrl}/ops" \\
+  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"op": "claim", "commitment": "${commitmentId}", "actor": "agent:claude-vps"}'
+\`\`\`
+
+### 2. Fix the Bug
+Use Read, Edit, Bash, Grep, Glob tools as needed.
+
+### 3. Capture Evidence (After Fixing)
+\`\`\`bash
+curl -X POST "${apiConfig.proxyUrl}/ops" \\
+  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"op": "capture", "body": "Fixed: <summary of what you fixed>", "kind": "evidence", "actor": "agent:claude-vps"}'
+\`\`\`
+Returns: {"id": "mem_XXXXXXXX", ...}
+
+### 4. Close Commitment (LAST)
+\`\`\`bash
+curl -X POST "${apiConfig.proxyUrl}/ops" \\
+  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
+  -H "Content-Type: application/json" \\
+  -d '{"op": "close", "commitment": "${commitmentId}", "evidence": "mem_XXXXXXXX", "actor": "agent:claude-vps"}'
+\`\`\`
+
+**Important**: You MUST capture evidence first, then use the returned mem_ID to close.
+
+When complete, output JSON:
+{"success": true, "summary": "what you did", "files_changed": ["file.ts"]}`;
+  }
+
+  /**
+   * Spawn Claude in terminal mode.
+   *
+   * Claude runs IN the workspace with full tool access and mentu CLI.
+   * Bridge's job is done after spawning - Claude handles claim/close.
+   *
+   * MENTU_* env vars are passed for CLI compatibility, and curl commands
+   * are included in the prompt as fallback for workspaces without .mentu.
+   */
+  private async spawnTerminalExecutor(
+    workingDirectory: string,
+    commitmentId: string,
+    timeoutSeconds: number,
+    commandId: string,
+    workspaceId: string,
+    apiConfig: { proxyUrl: string; apiKey: string }
+  ): Promise<ExecutionResult> {
+    return new Promise((resolve) => {
+      const prompt = this.buildExecutorPrompt(commitmentId, apiConfig);
+
+      console.log(`[BugExecutor] Spawning Claude in: ${workingDirectory}`);
+
+      const proc = spawn("claude", [
+        "--dangerously-skip-permissions",
+        "--max-turns", "50",
+        "-p", prompt
+      ], {
+        cwd: workingDirectory,
+        timeout: timeoutSeconds * 1000,
+        env: {
+          ...process.env,
+          MENTU_BRIDGE_COMMAND_ID: commandId,
+          // Mentu API configuration for CLI
+          MENTU_API_URL: apiConfig.proxyUrl,
+          MENTU_PROXY_TOKEN: apiConfig.apiKey,
+          MENTU_WORKSPACE_ID: workspaceId,
+          MENTU_ACTOR: 'agent:claude-vps',
+        }
+      });
+
+      let stdout = "";
+      let stderr = "";
+
+      proc.stdout.on("data", (data) => {
+        const chunk = data.toString();
+        stdout += chunk;
+        console.log(`[Executor] ${chunk.trim()}`);
+      });
+
+      proc.stderr.on("data", (data) => {
+        const chunk = data.toString();
+        stderr += chunk;
+        console.error(`[Executor:stderr] ${chunk.trim()}`);
+      });
+
+      proc.on("close", (code) => {
+        const exitCode = code ?? 1;
+        console.log(`[BugExecutor] Claude exited with code ${exitCode}`);
+
+        // Try to extract JSON result from output
+        const jsonMatch = stdout.match(/\{[\s\S]*?"success"[\s\S]*?\}/);
+        if (jsonMatch) {
+          try {
+            const parsed = JSON.parse(jsonMatch[0]);
+            resolve({
+              success: parsed.success ?? (exitCode === 0),
+              summary: parsed.summary ?? stdout.slice(-500),
+              files_changed: parsed.files_changed ?? [],
+              tests_passed: parsed.tests_passed ?? false,
+              exit_code: exitCode,
+              output: stdout
+            });
+            return;
+          } catch {
+            // Fall through to default
+          }
+        }
+
+        resolve({
+          success: exitCode === 0,
+          summary: stdout.slice(-1000) || stderr.slice(-500) || "No output",
+          files_changed: [],
+          tests_passed: false,
+          exit_code: exitCode,
+          output: stdout
+        });
+      });
+
+      proc.on("error", (err) => {
+        console.error(`[BugExecutor] Spawn error:`, err);
+        resolve({
+          success: false,
+          summary: `Spawn error: ${err.message}`,
+          files_changed: [],
+          tests_passed: false,
+          exit_code: 1,
+          output: stderr
+        });
+      });
     });
   }
 }

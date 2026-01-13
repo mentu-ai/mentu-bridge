@@ -2,7 +2,8 @@ import { createClient, RealtimeChannel, SupabaseClient } from '@supabase/supabas
 import { spawn, ChildProcess } from 'child_process';
 import * as os from 'os';
 import * as fs from 'fs';
-import type { BridgeConfig, Command, ExecutionResult, MentuOperation, WorktreeEnv } from './types.js';
+import ws from 'ws';
+import type { BridgeConfig, Command, ExecutionResult, MentuOperation, WorktreeEnv, WorkspaceConfig } from './types.js';
 import { CommitmentScheduler, type ExecuteCommitmentEvent } from './scheduler.js';
 import { ApprovalHandler } from './approval.js';
 import { GenesisEnforcer } from './genesis-enforcer.js';
@@ -13,13 +14,14 @@ import {
   isGitRepo,
   getWorktreePath,
 } from './worktree.js';
-import { releaseExecutorLock } from './executor-lock.js';
 import { BugExecutor } from './bug-executor.js';
+import { discoverWorkspaces, getWorkspaceDirectory } from './workspace-discovery.js';
 
 export class BridgeDaemon {
   private config: BridgeConfig;
   private supabase: SupabaseClient;
   private channel: RealtimeChannel | null = null;
+  private channels: RealtimeChannel[] = [];
   private currentProcess: ChildProcess | null = null;
   private currentCommandId: string | null = null;
   private heartbeatInterval: NodeJS.Timeout | null = null;
@@ -27,12 +29,31 @@ export class BridgeDaemon {
   private approvalHandler: ApprovalHandler;
   private enforcers: Map<string, GenesisEnforcer> = new Map();
   private bugExecutor?: BugExecutor;
+  private workspaces: WorkspaceConfig[] = [];
+  private processingCommands: Set<string> = new Set();  // Track in-flight commands
+  private isReconnecting = false;  // Prevent cascading reconnects
 
   constructor(config: BridgeConfig) {
     this.config = config;
     this.supabase = createClient(
       config.supabase.url,
-      config.supabase.anonKey
+      config.supabase.anonKey,
+      {
+        realtime: {
+          params: {
+            eventsPerSecond: 10,
+          },
+          heartbeatIntervalMs: 15000,  // 15 second heartbeat (more aggressive than default 30s)
+          reconnectAfterMs: (tries: number) => Math.min(tries * 1000, 30000),  // Exponential backoff: 1s, 2s, 3s... up to 30s
+          // Fix for Node.js < 22: explicitly provide WebSocket transport
+          // See: https://github.com/orgs/supabase/discussions/37869
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          transport: ws as any,
+        },
+        auth: {
+          persistSession: false,  // VPS daemon doesn't need session persistence
+        },
+      }
     );
     this.scheduler = new CommitmentScheduler(config);
     this.approvalHandler = new ApprovalHandler(this.supabase, config, (msg) => this.log(msg));
@@ -111,12 +132,32 @@ export class BridgeDaemon {
   async start(): Promise<void> {
     this.log('Starting bridge daemon...');
     this.log(`Machine ID: ${this.config.machine.id}`);
-    this.log(`Workspace ID: ${this.config.workspace.id}`);
+
+    // Discover workspaces from genesis.key files
+    const rootDirs = this.config.execution.allowed_directories;
+    this.workspaces = await discoverWorkspaces(this.supabase, rootDirs, this.config.machine.id);
+
+    if (this.workspaces.length === 0) {
+      // Fallback to config workspace for backwards compatibility
+      if (this.config.workspace?.id) {
+        this.log('[Discovery] No workspaces discovered, using config fallback');
+        this.workspaces = [{
+          id: this.config.workspace.id,
+          name: 'default',
+          directory: process.cwd(),
+        }];
+      } else {
+        this.log('[Discovery] No workspaces found. Exiting.');
+        process.exit(1);
+      }
+    }
+
+    this.log(`[Discovery] Active workspaces: ${this.workspaces.map(w => w.name).join(', ')}`);
 
     // Register machine
     await this.registerMachine();
 
-    // Subscribe to commands
+    // Subscribe to commands for all workspaces
     await this.subscribe();
 
     // Handle shutdown signals
@@ -146,16 +187,26 @@ export class BridgeDaemon {
     // Start commitment scheduler for due commitment polling
     this.scheduler.start();
 
-    // Start bug executor with beacon-parity features
-    const workspaceId = process.env.MENTU_WORKSPACE_ID || this.config.workspace.id;
+    // Start bug executor with discovered workspaces
     const machineId = process.env.MENTU_MACHINE_ID || this.config.machine.id;
 
-    if (workspaceId) {
-      this.bugExecutor = new BugExecutor(this.supabase, workspaceId, machineId);
-      await this.bugExecutor.start();
-      this.log('[Daemon] Bug executor started (beacon-parity mode)');
+    if (this.workspaces.length > 0) {
+      // Use service role client for BugExecutor if available (needed for operations table RLS)
+      const serviceRoleKey = this.config.supabase.serviceRoleKey || process.env.SUPABASE_SERVICE_ROLE_KEY;
+      const bugExecutorClient = serviceRoleKey
+        ? createClient(this.config.supabase.url, serviceRoleKey)
+        : this.supabase;
+
+      if (serviceRoleKey) {
+        this.log('[Daemon] BugExecutor using service role key (RLS bypass)');
+      }
+
+      this.bugExecutor = new BugExecutor(bugExecutorClient, this.workspaces, machineId);
+      // Don't call start() - daemon routes bug_execution commands directly via executeBugCommand
+      // This avoids race conditions from dual polling
+      this.log('[Daemon] Bug executor created (daemon-routed mode)');
     } else {
-      this.log('[Daemon] MENTU_WORKSPACE_ID not set, bug executor disabled');
+      this.log('[Daemon] No workspaces, bug executor disabled');
     }
 
     this.log('Daemon running. Waiting for commands...');
@@ -259,39 +310,52 @@ export class BridgeDaemon {
   }
 
   private async subscribe(): Promise<void> {
-    this.channel = this.supabase
-      .channel('bridge-commands')
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'bridge_commands',
-          filter: `workspace_id=eq.${this.config.workspace.id}`,
-        },
-        (payload) => {
-          this.handleCommand(payload.new as Command);
-        }
-      )
-      .subscribe((status) => {
-        this.log(`Subscription status: ${status}`);
+    // Subscribe to each workspace
+    for (const workspace of this.workspaces) {
+      const channel = this.supabase
+        .channel(`bridge-commands-${workspace.name}`)
+        .on(
+          'postgres_changes',
+          {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'bridge_commands',
+            filter: `workspace_id=eq.${workspace.id}`,
+          },
+          (payload) => {
+            this.handleCommand(payload.new as Command);
+          }
+        )
+        .subscribe((status) => {
+          this.log(`[${workspace.name}] Subscription status: ${status}`);
 
-        // Auto-reconnect on channel errors
-        if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
-          this.log('Connection lost. Reconnecting in 5 seconds...');
-          setTimeout(() => this.reconnect(), 5000);
-        }
-      });
+          // Auto-reconnect on channel errors (only once for all channels)
+          if ((status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') && !this.isReconnecting) {
+            this.log(`[${workspace.name}] Connection lost. Reconnecting in 5 seconds...`);
+            this.isReconnecting = true;
+            setTimeout(() => this.reconnect(), 5000);
+          }
+        });
+
+      this.channels.push(channel);
+    }
+
+    // Keep single channel for backwards compat (used by reconnect)
+    this.channel = this.channels[0] || null;
   }
 
   private async reconnect(): Promise<void> {
     this.log('Attempting to reconnect...');
 
-    // Remove old channel
-    if (this.channel) {
-      await this.supabase.removeChannel(this.channel);
-      this.channel = null;
+    // Remove all channels
+    for (const channel of this.channels) {
+      await this.supabase.removeChannel(channel);
     }
+    this.channels = [];
+    this.channel = null;
+
+    // Allow reconnects again after clearing channels
+    this.isReconnecting = false;
 
     // Resubscribe
     await this.subscribe();
@@ -303,10 +367,17 @@ export class BridgeDaemon {
   private async processPendingCommands(): Promise<void> {
     this.log('Checking for pending commands...');
 
+    const workspaceIds = this.workspaces.map(w => w.id);
+
+    if (workspaceIds.length === 0) {
+      this.log('No workspace IDs to query');
+      return;
+    }
+
     const { data: pendingCommands, error } = await this.supabase
       .from('bridge_commands')
       .select('*')
-      .eq('workspace_id', this.config.workspace.id)
+      .in('workspace_id', workspaceIds)
       .eq('status', 'pending')
       .order('created_at', { ascending: true });
 
@@ -324,28 +395,44 @@ export class BridgeDaemon {
   }
 
   private async handleCommand(command: Command): Promise<void> {
+    this.log(`[handleCommand] Checking command ${command.id} (target: ${command.target_machine_id}, status: ${command.status})`);
+
     // Check if targeted at another machine
     if (
       command.target_machine_id &&
       command.target_machine_id !== this.config.machine.id
     ) {
+      this.log(`[handleCommand] Skipping ${command.id} - target mismatch (${command.target_machine_id} !== ${this.config.machine.id})`);
       return; // Not for us
     }
 
     // Skip if already completed or running
     if (command.status === 'completed' || command.status === 'running' || command.status === 'failed' || command.status === 'timeout') {
+      this.log(`[handleCommand] Skipping ${command.id} - status is ${command.status}`);
+      return;
+    }
+
+    // Skip if already being processed by this daemon instance (prevents race from multiple workspace subscriptions)
+    if (this.processingCommands.has(command.id)) {
+      this.log(`[handleCommand] Skipping ${command.id} - already processing`);
       return;
     }
 
     // Attempt to claim (or verify already claimed by us)
+    this.log(`[handleCommand] Attempting to claim ${command.id}...`);
     const claimed = await this.claimCommand(command.id);
     if (claimed === false) {
       this.log(`Command ${command.id} already claimed by another machine`);
       return;
     }
     if (claimed === 'already_mine') {
-      this.log(`Command ${command.id} already claimed by this machine, executing...`);
+      // Already claimed by us but not in processingCommands - resume execution
+      // This happens after daemon restart when a command was claimed but not completed
+      this.log(`[handleCommand] Resuming ${command.id} - was claimed by us but not completed`);
     }
+
+    // Mark as processing
+    this.processingCommands.add(command.id);
 
     this.log(`Executing command ${command.id}`);
     this.log(`  Agent: ${command.agent}`);
@@ -364,6 +451,7 @@ export class BridgeDaemon {
         error_message: genesisError,
       });
       this.currentCommandId = null;
+      this.processingCommands.delete(command.id);
       return;
     }
 
@@ -377,8 +465,26 @@ export class BridgeDaemon {
       // Validate
       this.validateCommand(command);
 
-      // Execute
-      const result = await this.executeCommand(command);
+      // Route based on command_type
+      let result: ExecutionResult;
+
+      if (command.command_type === 'bug_execution' && this.bugExecutor) {
+        // Delegate bug_execution to BugExecutor (Auditor+Executor pattern)
+        this.log(`[handleCommand] Routing ${command.id} to BugExecutor (command_type: bug_execution)`);
+        const bugResult = await this.bugExecutor.executeBugCommand(command as any);
+        // Adapt BugExecutor result to daemon's ExecutionResult format
+        result = {
+          status: bugResult.success ? 'success' : 'failed',
+          exit_code: bugResult.exit_code,
+          stdout: bugResult.output || bugResult.summary,
+          stderr: bugResult.error || bugResult.blocked_reason || '',
+          error_message: bugResult.error || bugResult.blocked_reason,
+        };
+        this.log(`[handleCommand] BugExecutor completed: ${bugResult.success ? 'success' : 'failed'} - ${bugResult.summary?.slice(0, 100)}`);
+      } else {
+        // Standard execution
+        result = await this.executeCommand(command);
+      }
 
       // Check if approval is required
       if (command.approval_required && result.status === 'success') {
@@ -461,6 +567,7 @@ export class BridgeDaemon {
     }
 
     this.currentCommandId = null;
+    this.processingCommands.delete(command.id);
   }
 
   private async claimCommand(commandId: string): Promise<boolean | 'already_mine'> {
@@ -525,7 +632,11 @@ export class BridgeDaemon {
 
   private async executeCommand(command: Command): Promise<ExecutionResult> {
     const agentConfig = this.config.agents[command.agent];
-    const args = [...agentConfig.default_flags, ...command.flags, command.prompt];
+    // For Claude agent, use -p flag for headless mode (prompt must come after -p)
+    const isClaudeAgent = command.agent === 'claude';
+    const args = isClaudeAgent
+      ? [...agentConfig.default_flags, ...command.flags, '-p', command.prompt]
+      : [...agentConfig.default_flags, ...command.flags, command.prompt];
 
     // Determine execution directory and environment
     let execDir = command.working_directory;
@@ -591,6 +702,8 @@ export class BridgeDaemon {
         ...(process.env.CLAUDE_CODE_OAUTH_TOKEN && {
           CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
         }),
+        // Pass command ID for spawn_logs hook correlation
+        MENTU_BRIDGE_COMMAND_ID: command.id,
       };
 
       const child = spawn(agentConfig.path, args, {
@@ -705,9 +818,6 @@ export class BridgeDaemon {
   async shutdown(): Promise<void> {
     this.log('Shutting down...');
 
-    // Release executor lock FIRST
-    releaseExecutorLock();
-
     // Stop scheduler
     this.scheduler.stop();
 
@@ -745,10 +855,11 @@ export class BridgeDaemon {
       .update({ status: 'offline' })
       .eq('id', this.config.machine.id);
 
-    // Unsubscribe
-    if (this.channel) {
-      await this.supabase.removeChannel(this.channel);
+    // Unsubscribe all channels
+    for (const channel of this.channels) {
+      await this.supabase.removeChannel(channel);
     }
+    this.channels = [];
 
     this.log('Shutdown complete');
     process.exit(0);

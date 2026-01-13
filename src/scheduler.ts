@@ -370,7 +370,7 @@ export class CommitmentScheduler {
     wait_type: string | null;
   }>> {
     const response = await fetch(
-      `${this.config.mentu.proxy_url}/commitments?state=open&limit=50`,
+      `${this.config.mentu.proxy_url}/rest/v1/commitments?state=eq.open&limit=50&select=id,body,source,state,owner,meta`,
       {
         headers: {
           'X-Proxy-Token': this.config.mentu.api_key,
@@ -382,8 +382,7 @@ export class CommitmentScheduler {
       throw new Error(`Failed to fetch commitments: ${response.status}`);
     }
 
-    const data = await response.json() as { commitments: Commitment[] };
-    const commitments = data.commitments || [];
+    const commitments = await response.json() as Commitment[];
     const now = new Date();
     const waiting: Array<{
       id: string;
@@ -433,7 +432,7 @@ export class CommitmentScheduler {
 
     try {
       const response = await fetch(
-        `${this.config.mentu.proxy_url}/commitments?state=open&limit=50`,
+        `${this.config.mentu.proxy_url}/rest/v1/commitments?state=eq.open&limit=50&select=id,body,source,state,owner,meta`,
         {
           headers: {
             'X-Proxy-Token': this.config.mentu.api_key,
@@ -446,8 +445,7 @@ export class CommitmentScheduler {
         return result;
       }
 
-      const data = await response.json() as { commitments: Commitment[] };
-      const commitments = data.commitments || [];
+      const commitments = await response.json() as Commitment[];
       const now = new Date();
 
       for (const c of commitments) {
@@ -550,7 +548,7 @@ export class CommitmentScheduler {
    */
   private async fetchDueCommitments(): Promise<Commitment[]> {
     const response = await fetch(
-      `${this.config.mentu.proxy_url}/commitments?state=open&limit=20`,
+      `${this.config.mentu.proxy_url}/rest/v1/commitments?state=eq.open&limit=20&select=id,body,source,state,owner,meta`,
       {
         headers: {
           'X-Proxy-Token': this.config.mentu.api_key,
@@ -562,14 +560,19 @@ export class CommitmentScheduler {
       throw new Error(`Failed to fetch commitments: ${response.status}`);
     }
 
-    const data = await response.json() as { commitments: Commitment[] };
-    const commitments = data.commitments || [];
+    const commitments = await response.json() as Commitment[];
     const now = new Date();
     const ready: Commitment[] = [];
 
     for (const c of commitments) {
       // Must be unowned
       if (c.owner) continue;
+
+      // Skip bug commitments - these are handled by BugExecutor, not Scheduler
+      // Bug commitments have body starting with "Investigate:" and are processed via bridge_commands
+      if (c.body.startsWith('Investigate:')) {
+        continue;
+      }
 
       // Check affinity (bridge or unspecified)
       const affinity = c.meta?.affinity;
