@@ -12,7 +12,6 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { spawn, ChildProcess, exec } from "child_process";
 import * as crypto from "crypto";
-import * as fs from "fs";
 import type { WorkspaceConfig } from "./types.js";
 
 // ============================================================================
@@ -941,36 +940,32 @@ Begin by searching for code related to the bug description.`;
   }
 
   // --------------------------------------------------------------------------
-  // Ledger Verification
+  // Ledger Verification (via Supabase)
   // --------------------------------------------------------------------------
 
-  private async checkLedgerClose(cwd: string, commitmentId: string): Promise<boolean> {
-    const ledgerPath = `${cwd}/.mentu/ledger.jsonl`;
+  private async checkLedgerClose(_cwd: string, commitmentId: string): Promise<boolean> {
+    // Query Supabase for close operation instead of local ledger
+    // The mentu CLI syncs to Supabase, so we verify there
+    try {
+      const { data, error } = await this.supabase
+        .from('operations')
+        .select('id')
+        .eq('op', 'close')
+        .filter('payload->>commitment', 'eq', commitmentId)
+        .limit(1);
 
-    return new Promise((resolve) => {
-      fs.readFile(ledgerPath, 'utf-8', (error, data) => {
-        if (error) {
-          this.log(`Ledger read error: ${error.message}`);
-          resolve(false);
-          return;
-        }
+      if (error) {
+        this.log(`Supabase close check error: ${error.message}`);
+        return false;
+      }
 
-        // Parse JSONL and look for close operation on this commitment
-        const lines = data.trim().split('\n');
-        for (const line of lines.reverse()) { // Check recent ops first
-          try {
-            const op = JSON.parse(line);
-            if (op.op === 'close' && op.payload?.commitment === commitmentId) {
-              return resolve(true);
-            }
-          } catch {
-            // Skip invalid JSON lines
-          }
-        }
-
-        resolve(false);
-      });
-    });
+      const found = (data?.length ?? 0) > 0;
+      this.log(`Supabase close check for ${commitmentId}: ${found ? 'FOUND' : 'not found'}`);
+      return found;
+    } catch (err) {
+      this.log(`Supabase close check exception: ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
   }
 
   // --------------------------------------------------------------------------
