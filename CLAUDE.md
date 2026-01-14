@@ -21,6 +21,30 @@ The bridge daemon:
 5. Captures Mentu memories for task/evidence tracking
 6. Polls for due commitments and executes them on schedule
 
+## Execution Mode: Persistent
+
+This daemon provides **persistent execution** - work that survives terminal closure.
+
+**Full specification**: `mentu-ai/docs/Execution-Modes.md`
+
+```
+Session-Bound (Task tool)     vs     Persistent (mentu-bridge)
+─────────────────────────────────────────────────────────────────
+Child of terminal                    Separate daemon (launchd)
+Dies when parent exits               Runs 24/7, survives exit
+Synchronous result                   Async (poll for status)
+Use for: research, exploration       Use for: screenshots, long tasks
+```
+
+**When agents should use me**:
+- Screenshot capture (visual verification)
+- Long-running test suites (>2 minutes)
+- Deployments and builds
+- Any work that must complete after executor exits
+- Scheduled/recurring tasks
+
+**API**: `POST https://mentu-proxy.affihub.workers.dev/bridge/spawn`
+
 ## Architecture
 
 ```
@@ -52,6 +76,33 @@ launchctl list | grep mentu
 # Logs
 tail -f /tmp/mentu-bridge.log
 ```
+
+## Authentication
+
+### Claude Spawning
+
+The daemon spawns Claude CLI processes with environment inheritance:
+
+```typescript
+const env = {
+  ...process.env,
+  // OAuth token passed to spawned Claude processes
+  ...(process.env.CLAUDE_CODE_OAUTH_TOKEN && {
+    CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
+  }),
+};
+```
+
+**Required environment**:
+- `CLAUDE_CODE_OAUTH_TOKEN` - For spawned Claude CLI processes
+- Token set in `/home/mentu/.mentu.env` on VPS (systemd EnvironmentFile)
+- Token set in `~/.zshrc` on Mac (launchd inherits from shell)
+
+**Convention**: Never hardcode tokens. Always pass from environment.
+
+See `Workspaces/CLAUDE.md` for the full authentication convention.
+
+---
 
 ## Configuration
 

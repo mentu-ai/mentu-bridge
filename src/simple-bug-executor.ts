@@ -946,17 +946,33 @@ Begin by searching for code related to the bug description.`;
   private async checkLedgerClose(_cwd: string, commitmentId: string): Promise<boolean> {
     // Query Supabase for close operation instead of local ledger
     // The mentu CLI syncs to Supabase, so we verify there
+    this.log(`Checking Supabase for close operation on ${commitmentId}...`);
+
     try {
+      // Use contains filter for JSONB - more reliable than ->> syntax
       const { data, error } = await this.supabase
         .from('operations')
-        .select('id')
+        .select('id, payload')
         .eq('op', 'close')
-        .filter('payload->>commitment', 'eq', commitmentId)
+        .contains('payload', { commitment: commitmentId })
         .limit(1);
 
       if (error) {
         this.log(`Supabase close check error: ${error.message}`);
-        return false;
+        // Fallback: fetch recent close ops and filter in JS
+        const { data: fallbackData } = await this.supabase
+          .from('operations')
+          .select('id, payload')
+          .eq('op', 'close')
+          .order('id', { ascending: false })
+          .limit(50);
+
+        const found = fallbackData?.some(
+          (op: { payload?: { commitment?: string } }) =>
+            op.payload?.commitment === commitmentId
+        ) ?? false;
+        this.log(`Supabase close check (fallback) for ${commitmentId}: ${found ? 'FOUND' : 'not found'}`);
+        return found;
       }
 
       const found = (data?.length ?? 0) > 0;

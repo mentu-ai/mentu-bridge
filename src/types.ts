@@ -1,3 +1,10 @@
+export interface WorkspaceConfig {
+  id: string;
+  name: string;
+  directory: string;
+  genesis?: string;
+}
+
 export interface BridgeConfig {
   machine: {
     id: string;
@@ -6,12 +13,15 @@ export interface BridgeConfig {
   workspace: {
     id: string;
   };
+  // Multi-workspace support (preferred over single workspace)
+  workspaces?: WorkspaceConfig[];
   user: {
     id: string;
   };
   supabase: {
     url: string;
     anonKey: string;
+    serviceRoleKey?: string;  // For operations that need RLS bypass
   };
   mentu: {
     proxy_url: string;
@@ -74,6 +84,15 @@ export interface Command {
   // Worktree isolation
   with_worktree?: boolean;         // Create worktree before spawn
   commitment_id?: string;          // Commitment ID for worktree naming
+
+  // Bug execution support
+  command_type?: 'spawn' | 'bug_execution';
+  payload?: {
+    memory_id?: string;
+    commitment_id?: string;
+    timeout_seconds?: number;
+    [key: string]: unknown;
+  };
 }
 
 export interface WorktreeEnv {

@@ -33,6 +33,7 @@ export interface CraftExecutionResult {
 export class CraftExecutor {
   private supabase: SupabaseClient;
   private workspaceId: string;
+  private currentCommandId?: string;
 
   constructor(supabase: SupabaseClient, workspaceId: string) {
     this.supabase = supabase;
@@ -54,8 +55,10 @@ export class CraftExecutor {
     workingDirectory: string,
     commitmentId: string,
     streamer: OutputStreamer,
-    timeoutSeconds: number = 3600
+    timeoutSeconds: number = 3600,
+    commandId?: string
   ): Promise<CraftExecutionResult> {
+    this.currentCommandId = commandId;
     const featureName = parseCraftFeatureName(prompt);
     if (!featureName) {
       return {
@@ -249,7 +252,10 @@ The HANDOFF must include:
       const proc = spawn('claude', args, {
         cwd: workingDirectory,
         timeout: timeoutMs,
-        env: { ...process.env }
+        env: {
+          ...process.env,
+          ...(this.currentCommandId && { MENTU_BRIDGE_COMMAND_ID: this.currentCommandId }),
+        }
       });
 
       let stdout = '';

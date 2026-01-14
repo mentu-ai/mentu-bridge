@@ -132,40 +132,56 @@ From the HANDOFF, extract:
 
 ---
 
-## Phase 3: Update Completion Contract
+## Phase 3: Create Execution Contract
 
-First action — update `.claude/completion.json`:
+First action — create `feature_list.json` (replaces completion.json):
 
 ```json
 {
-  "version": "2.0",
-  "name": "{Task Name from HANDOFF}",
-  "tier": "{T2|T3|T4}",
-  "required_files": [
-    "{from HANDOFF}"
+  "$schema": "feature-list-v1",
+  "instruction_id": "HANDOFF-{Name}-v{X.Y}",
+  "created": "{ISO timestamp}",
+  "status": "in_progress",
+  "tier": "{T1|T2|T3}",
+  "mentu": {
+    "commitment": "cmt_EXECUTION",
+    "source": "mem_XXXXXXXX"
+  },
+  "features": [
+    {
+      "id": "F001",
+      "description": "{First acceptance criterion from HANDOFF}",
+      "acceptance": ["{sub-criteria}"],
+      "passes": false,
+      "evidence": null
+    },
+    {
+      "id": "F002",
+      "description": "{Second acceptance criterion}",
+      "acceptance": [],
+      "passes": false,
+      "evidence": null
+    }
   ],
   "checks": {
     "tsc": true,
     "build": true,
-    "test": true
-  },
-  "mentu": {
-    "enabled": true,
-    "actor": "agent:claude-executor",
-    "commitments": {
-      "mode": "dynamic",
-      "require_closed": true,
-      "require_evidence": true
-    }
-  },
-  "provenance": {
-    "intent": "INTENT-{Name}-v{X.Y}",
-    "audit": "AUDIT-{Name}-v{X.Y}",
-    "handoff": "HANDOFF-{Name}-v{X.Y}",
-    "trust_level": "authorized"
+    "test": false
   }
 }
 ```
+
+**Extract features from HANDOFF acceptance criteria.** Each becomes a tracked feature.
+
+### Feature Completion Pattern
+
+For each feature:
+1. Implement the feature
+2. Test it
+3. `mentu capture "Completed F00X: {description}"`
+4. Update feature_list.json: `passes: true`, `evidence: "mem_xxx"`
+
+The stop hook blocks until all features pass.
 
 ---
 
@@ -384,8 +400,8 @@ Create: `docs/SCOPE-EXPANSION-{Name}.md` explaining:
 - [ ] Constraints identified
 
 ### Phase 3: Contract
-- [ ] completion.json updated
-- [ ] Provenance recorded
+- [ ] feature_list.json created with features from HANDOFF
+- [ ] Commitment ID recorded in mentu section
 
 ### Phase 4: Execute
 - [ ] All stages completed

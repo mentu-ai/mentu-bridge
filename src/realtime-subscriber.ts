@@ -29,6 +29,17 @@ export interface BridgeCommand {
   with_worktree: boolean;
   commitment_id?: string;
   created_at?: string;
+  // Bug execution support
+  command_type?: 'spawn' | 'bug_execution';
+  payload?: {
+    memory_id?: string;
+    commitment_id?: string;
+    bug_title?: string;
+    timeout_seconds?: number;
+    approval_mode?: string;
+    [key: string]: unknown;
+  };
+  result?: unknown;
 }
 
 export type RealtimeEvent =

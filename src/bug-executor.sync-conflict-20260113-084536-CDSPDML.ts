@@ -953,7 +953,7 @@ If you cannot fix within scope, output:
 
   /**
    * Call Claude CLI for simple JSON output.
-   * Uses --max-turns 20 to allow codebase exploration before JSON response.
+   * Uses --max-turns 5 to allow some tool exploration before JSON response.
    * IMPORTANT: shell: true is required for Claude to work properly via spawn.
    */
   private callClaudeSimple(prompt: string, cwd: string, timeoutMs: number): Promise<string> {
@@ -962,7 +962,7 @@ If you cannot fix within scope, output:
       const escapedPrompt = prompt.replace(/'/g, "'\\''");
       const proc = spawn("claude", [
         "--dangerously-skip-permissions",
-        "--max-turns", "20",
+        "--max-turns", "5",
         "-p", `'${escapedPrompt}'`
       ], {
         cwd,
@@ -1017,6 +1017,9 @@ If you cannot fix within scope, output:
       throw new Error("Bug execution requires commitment_id");
     }
 
+    // Update status to running (sets started_at)
+    await this.updateCommandStatus(command.id, 'running');
+
     // Step 1: Fetch bug memory
     console.log(`[BugExecutor] Fetching bug memory ${memoryId}`);
     const bugMemory = await this.fetchBugMemory(command.workspace_id, memoryId);
@@ -1029,41 +1032,21 @@ If you cannot fix within scope, output:
     const audit = await this.craftAudit(bugMemory, workingDirectory);
     console.log(`[BugExecutor] Auditor hypothesis: ${audit.context.hypothesis}`);
 
-    // Step 3: Build API config for Claude to use
-    const apiConfig = {
-      proxyUrl: process.env.MENTU_API_URL || 'https://mentu-proxy.affihub.workers.dev',
-      apiKey: process.env.MENTU_PROXY_TOKEN || '',
-      workspaceId: command.workspace_id,
-      actor: 'agent:claude-vps'
-    };
-
-    // Step 4: Write context file for Claude to read (with API config)
+    // Step 3: Write context file for Claude to read
     console.log(`[BugExecutor] Writing bug context file`);
     const contextPath = await writeBugContext({
       commitmentId,
       audit,
-      workingDirectory,
-      apiConfig
+      workingDirectory
     });
     console.log(`[BugExecutor] Context written to: ${contextPath}`);
 
-    if (!apiConfig.apiKey) {
-      console.warn(`[BugExecutor] Warning: MENTU_PROXY_TOKEN not set, API calls may fail`);
-    }
-
-    // Step 5: Spawn Claude in terminal mode
+    // Step 4: Spawn Claude in terminal mode
     // Claude will claim, fix, capture evidence, and close
     console.log(`[BugExecutor] Spawning terminal executor in ${workingDirectory}`);
-    const result = await this.spawnTerminalExecutor(
-      workingDirectory,
-      commitmentId,
-      timeoutSeconds,
-      command.id,
-      command.workspace_id,
-      apiConfig
-    );
+    const result = await this.spawnTerminalExecutor(workingDirectory, commitmentId, timeoutSeconds, command.id);
 
-    // Step 6: Store result in bridge_commands.result
+    // Step 5: Store result in bridge_commands.result
     const { error: updateError } = await this.supabase
       .from("bridge_commands")
       .update({ result: { audit, execution: result } })
@@ -1082,76 +1065,31 @@ If you cannot fix within scope, output:
   }
 
   /**
-   * Build the prompt for the executor with API instructions.
-   * This provides both mentu CLI env vars AND curl fallback commands.
-   */
-  private buildExecutorPrompt(
-    commitmentId: string,
-    workspaceId: string,
-    apiConfig: { proxyUrl: string; apiKey: string }
-  ): string {
-    return `You are fixing a bug for commitment ${commitmentId}.
-
-Read .mentu/bug-context.md for full instructions.
-
-## Mentu API
-
-**Base URL**: ${apiConfig.proxyUrl}
-**Auth Header**: X-Proxy-Token: ${apiConfig.apiKey}
-
-### 1. Claim Commitment (FIRST)
-\`\`\`bash
-curl -X POST "${apiConfig.proxyUrl}/ops" \\
-  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"op": "claim", "commitment": "${commitmentId}", "actor": "agent:claude-vps"}'
-\`\`\`
-
-### 2. Fix the Bug
-Use Read, Edit, Bash, Grep, Glob tools as needed.
-
-### 3. Capture Evidence (After Fixing)
-\`\`\`bash
-curl -X POST "${apiConfig.proxyUrl}/ops" \\
-  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"op": "capture", "body": "Fixed: <summary of what you fixed>", "kind": "evidence", "workspace_id": "${workspaceId}", "actor": "agent:claude-vps"}'
-\`\`\`
-Returns: {"id": "mem_XXXXXXXX", ...}
-
-### 4. Close Commitment (LAST)
-\`\`\`bash
-curl -X POST "${apiConfig.proxyUrl}/ops" \\
-  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"op": "close", "commitment": "${commitmentId}", "evidence": "mem_XXXXXXXX", "actor": "agent:claude-vps"}'
-\`\`\`
-
-**Important**: You MUST capture evidence first, then use the returned mem_ID to close.
-
-When complete, output JSON:
-{"success": true, "summary": "what you did", "files_changed": ["file.ts"]}`;
-  }
-
-  /**
    * Spawn Claude in terminal mode.
    *
    * Claude runs IN the workspace with full tool access and mentu CLI.
    * Bridge's job is done after spawning - Claude handles claim/close.
-   *
-   * MENTU_* env vars are passed for CLI compatibility, and curl commands
-   * are included in the prompt as fallback for workspaces without .mentu.
    */
   private async spawnTerminalExecutor(
     workingDirectory: string,
     commitmentId: string,
     timeoutSeconds: number,
-    commandId: string,
-    workspaceId: string,
-    apiConfig: { proxyUrl: string; apiKey: string }
+    commandId: string
   ): Promise<ExecutionResult> {
     return new Promise((resolve) => {
-      const prompt = this.buildExecutorPrompt(commitmentId, workspaceId, apiConfig);
+      const prompt = `You are fixing a bug for commitment ${commitmentId}.
+
+Read .mentu/bug-context.md for full instructions.
+
+Key steps:
+1. mentu claim ${commitmentId}
+2. Fix the bug (you have Read, Edit, Bash, Grep, Glob)
+3. Verify your fix
+4. mentu capture "Fixed: <summary>" --kind evidence
+5. mentu close ${commitmentId} --evidence <mem_id>
+
+When complete, output JSON:
+{"success": true, "summary": "what you did", "files_changed": ["file.ts"]}`;
 
       console.log(`[BugExecutor] Spawning Claude in: ${workingDirectory}`);
 
@@ -1165,11 +1103,6 @@ When complete, output JSON:
         env: {
           ...process.env,
           MENTU_BRIDGE_COMMAND_ID: commandId,
-          // Mentu API configuration for CLI
-          MENTU_API_URL: apiConfig.proxyUrl,
-          MENTU_PROXY_TOKEN: apiConfig.apiKey,
-          MENTU_WORKSPACE_ID: workspaceId,
-          MENTU_ACTOR: 'agent:claude-vps',
         }
       });
 

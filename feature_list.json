@@ -1,0 +1,41 @@
+{
+  "$schema": "feature-list-v1",
+  "instruction_id": "HANDOFF-BugExecutionFixes-v1.0",
+  "created": "2026-01-13T04:30:00Z",
+  "status": "completed",
+  "tier": "T2",
+  "mentu": {
+    "commitment": "cmt_6ffc4ed3",
+    "source": "mem_51580b64"
+  },
+  "features": [
+    {
+      "id": "F001",
+      "description": "Result storage persists audit and execution data to bridge_commands.result",
+      "passes": true,
+      "evidence": "src/bug-executor.ts:957-969 - Added error handling and verification to result storage"
+    },
+    {
+      "id": "F002",
+      "description": "Working directory resolved from workspace config for bug source project",
+      "passes": true,
+      "evidence": "src/bug-executor.ts:105-117 resolveWorkspaceDirectory(), lines 939-945 in executeBugCommand"
+    },
+    {
+      "id": "F003",
+      "description": "Stale command cleanup runs on daemon startup",
+      "passes": true,
+      "evidence": "src/bug-executor.ts:119-160 cleanupStaleCommands(), called at line 170 in start()"
+    },
+    {
+      "id": "F004",
+      "description": "Ledger operations use correct auth token from environment",
+      "passes": true,
+      "evidence": "src/config.ts:63-80 - Checks MENTU_API_KEY, MENTU_PROXY_TOKEN, X_PROXY_TOKEN with improved logging"
+    }
+  ],
+  "checks": {
+    "tsc": true,
+    "build": true
+  }
+}

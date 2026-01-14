@@ -38,8 +38,9 @@ export function loadConfig(): BridgeConfig {
   if (!config.machine?.id) {
     throw new Error('Missing machine.id in config');
   }
+  // workspace.id is optional now - discovery from genesis.key is preferred
   if (!config.workspace?.id) {
-    throw new Error('Missing workspace.id in config');
+    console.log('[Config] No workspace.id configured - will use genesis.key discovery');
   }
   if (!config.supabase?.url) {
     throw new Error('Missing supabase.url in config or environment');
@@ -60,13 +61,30 @@ export function loadConfig(): BridgeConfig {
   };
 
   // Mentu integration config (for auto-capturing tasks and evidence)
+  // Environment variables take precedence over YAML config for secrets
+  const apiKeyFromEnv = process.env.MENTU_API_KEY
+    || process.env.MENTU_PROXY_TOKEN
+    || process.env.X_PROXY_TOKEN;
+
+  // Initialize mentu config with defaults if not present
   config.mentu = config.mentu || {
-    proxy_url: process.env.MENTU_PROXY_URL || 'https://mentu-proxy.affihub.workers.dev',
-    api_key: process.env.MENTU_API_KEY || '',
+    proxy_url: 'https://mentu-proxy.affihub.workers.dev',
+    api_key: '',
   };
 
+  // Environment variables override YAML for proxy_url and api_key
+  if (process.env.MENTU_PROXY_URL) {
+    config.mentu.proxy_url = process.env.MENTU_PROXY_URL;
+  }
+  if (apiKeyFromEnv) {
+    config.mentu.api_key = apiKeyFromEnv;
+  }
+
   if (!config.mentu.api_key) {
-    console.warn('Warning: mentu.api_key not set. Bridge commands will not be recorded in Mentu.');
+    console.warn('[Config] Warning: No Mentu API key found. Checked: MENTU_API_KEY, MENTU_PROXY_TOKEN, X_PROXY_TOKEN');
+    console.warn('[Config] Bridge captures via proxy will fail. Direct Supabase operations will still work.');
+  } else {
+    console.log('[Config] Mentu API key loaded from environment');
   }
 
   return config as BridgeConfig;

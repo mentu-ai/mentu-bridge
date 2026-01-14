@@ -16,7 +16,6 @@ import { WorktreeManager } from "./worktree-manager.js";
 import { OutputStreamer } from "./output-streamer.js";
 import { CraftExecutor } from "./craft-executor.js";
 import { isCraftPrompt } from "./prompt-builder.js";
-import { writeBugContext } from './context-writer.js';
 import type { WorkspaceConfig } from "./types.js";
 import type { AuditOutput } from "./types/audit-output.js";
 
@@ -568,6 +567,79 @@ export class BugExecutor {
   }
 
   /**
+   * Commit and push changes to git after successful bug fix.
+   * Part of AutonomousBugFixer v1.0 - git push capability.
+   */
+  private async gitCommitAndPush(
+    workingDirectory: string,
+    result: ExecutionResult,
+    commitmentId?: string
+  ): Promise<{ committed: boolean; pushed: boolean; branch?: string; error?: string }> {
+    const { execSync } = require('child_process');
+
+    try {
+      // Check if there are changes to commit
+      const status = execSync('git status --porcelain', {
+        cwd: workingDirectory,
+        encoding: 'utf-8',
+        timeout: 30000,
+      }).trim();
+
+      if (!status) {
+        console.log('[BugExecutor] No changes to commit');
+        return { committed: false, pushed: false };
+      }
+
+      // Get current branch
+      const branch = execSync('git rev-parse --abbrev-ref HEAD', {
+        cwd: workingDirectory,
+        encoding: 'utf-8',
+        timeout: 10000,
+      }).trim();
+
+      // Stage all changes
+      execSync('git add -A', {
+        cwd: workingDirectory,
+        timeout: 30000,
+      });
+
+      // Build commit message
+      const filesChanged = result.files_changed.join(', ') || 'various files';
+      const commitMsg = `fix: ${result.summary.slice(0, 50)}
+
+Files changed: ${filesChanged}
+${commitmentId ? `Commitment: ${commitmentId}` : ''}
+
+Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>`;
+
+      // Commit
+      execSync(`git commit -m "${commitMsg.replace(/"/g, '\\"')}"`, {
+        cwd: workingDirectory,
+        timeout: 30000,
+      });
+
+      console.log(`[BugExecutor] Git commit successful on branch ${branch}`);
+
+      // Push to remote
+      try {
+        execSync(`git push origin ${branch}`, {
+          cwd: workingDirectory,
+          timeout: 60000,
+        });
+        console.log(`[BugExecutor] Git push successful to origin/${branch}`);
+        return { committed: true, pushed: true, branch };
+      } catch (pushError) {
+        console.warn('[BugExecutor] Git push failed:', pushError);
+        return { committed: true, pushed: false, branch, error: String(pushError) };
+      }
+
+    } catch (error) {
+      console.error('[BugExecutor] Git operations failed:', error);
+      return { committed: false, pushed: false, error: String(error) };
+    }
+  }
+
+  /**
    * Capture execution evidence
    */
   private async captureEvidence(workspaceId: string, commitmentId: string, result: ExecutionResult): Promise<string> {
@@ -953,7 +1025,7 @@ If you cannot fix within scope, output:
 
   /**
    * Call Claude CLI for simple JSON output.
-   * Uses --max-turns 20 to allow codebase exploration before JSON response.
+   * Uses --max-turns 5 to allow some tool exploration before JSON response.
    * IMPORTANT: shell: true is required for Claude to work properly via spawn.
    */
   private callClaudeSimple(prompt: string, cwd: string, timeoutMs: number): Promise<string> {
@@ -962,7 +1034,7 @@ If you cannot fix within scope, output:
       const escapedPrompt = prompt.replace(/'/g, "'\\''");
       const proc = spawn("claude", [
         "--dangerously-skip-permissions",
-        "--max-turns", "20",
+        "--max-turns", "5",
         "-p", `'${escapedPrompt}'`
       ], {
         cwd,
@@ -990,31 +1062,25 @@ If you cannot fix within scope, output:
   }
 
   /**
-   * Execute a bug_execution command using terminal-based Claude spawning.
-   *
-   * ARCHITECTURE CHANGE (v2.0):
-   * - Bridge is INFRASTRUCTURE only (no ledger operations)
-   * - Claude is the ACTOR (claims, captures, closes)
-   * - Auditor still runs headless for boundary analysis
-   * - Executor spawns in terminal mode with mentu CLI access
+   * Execute a bug_execution command using Architect+Auditor+Executor pattern.
+   * This is the main entry point for bug fix automation.
    */
   async executeBugCommand(command: BridgeCommand & { payload?: { memory_id?: string; commitment_id?: string; timeout_seconds?: number } }): Promise<ExecutionResult> {
     const payload = command.payload || {};
     const memoryId = payload.memory_id;
     const commitmentId = command.commitment_id || payload.commitment_id;
-    const timeoutSeconds = payload.timeout_seconds || command.timeout_seconds || 3600;
+    const timeoutSeconds = payload.timeout_seconds || command.timeout_seconds || 600;
 
-    // CRITICAL FIX: Use command.working_directory directly
-    // Do NOT use resolveWorkspaceDirectory() which overrides with workspace config
-    const workingDirectory = command.working_directory;
-    console.log(`[BugExecutor] Using command working_directory: ${workingDirectory}`);
+    // Resolve working directory from workspace config (F002)
+    // Bug memories come from a specific workspace - execution must happen there
+    const resolvedDirectory = this.resolveWorkspaceDirectory(command.workspace_id);
+    const workingDirectory = resolvedDirectory || command.working_directory;
+    if (resolvedDirectory) {
+      console.log(`[BugExecutor] Using workspace directory: ${resolvedDirectory}`);
+    }
 
     if (!memoryId) {
       throw new Error("Bug execution requires payload.memory_id");
-    }
-
-    if (!commitmentId) {
-      throw new Error("Bug execution requires commitment_id");
     }
 
     // Step 1: Fetch bug memory
@@ -1024,46 +1090,43 @@ If you cannot fix within scope, output:
       throw new Error(`Bug memory ${memoryId} not found`);
     }
 
-    // Step 2: Auditor - craft scoped boundaries (still headless, returns JSON)
+    // Step 2: Claim commitment in ledger
+    if (commitmentId) {
+      console.log(`[BugExecutor] Claiming commitment ${commitmentId}`);
+      const claimId = `op_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      await this.supabase.from("operations").insert({
+        id: claimId,
+        op: "claim",
+        ts: new Date().toISOString(),
+        actor: "agent:bridge-executor",
+        payload: { target: commitmentId },
+        workspace_id: command.workspace_id
+      });
+    }
+
+    // Step 3: Auditor - craft scoped boundaries (no prescriptive steps)
     console.log(`[BugExecutor] Crafting audit boundaries via Auditor`);
     const audit = await this.craftAudit(bugMemory, workingDirectory);
     console.log(`[BugExecutor] Auditor hypothesis: ${audit.context.hypothesis}`);
 
-    // Step 3: Build API config for Claude to use
-    const apiConfig = {
-      proxyUrl: process.env.MENTU_API_URL || 'https://mentu-proxy.affihub.workers.dev',
-      apiKey: process.env.MENTU_PROXY_TOKEN || '',
-      workspaceId: command.workspace_id,
-      actor: 'agent:claude-vps'
-    };
+    // Step 4: Executor - spawn Claude to fix the bug (decides HOW)
+    console.log(`[BugExecutor] Spawning executor with objective: ${audit.audit.objective.slice(0, 50)}...`);
+    const result = await this.spawnExecutor(audit, workingDirectory, timeoutSeconds);
+    this.logScopeCompliance(audit, result);  // Frame 2: Advisory scope logging
 
-    // Step 4: Write context file for Claude to read (with API config)
-    console.log(`[BugExecutor] Writing bug context file`);
-    const contextPath = await writeBugContext({
-      commitmentId,
-      audit,
-      workingDirectory,
-      apiConfig
-    });
-    console.log(`[BugExecutor] Context written to: ${contextPath}`);
-
-    if (!apiConfig.apiKey) {
-      console.warn(`[BugExecutor] Warning: MENTU_PROXY_TOKEN not set, API calls may fail`);
+    // Step 5: Git commit and push if fix was successful (AutonomousBugFixer v1.0)
+    if (result.success && result.files_changed.length > 0) {
+      console.log(`[BugExecutor] Attempting git commit and push for successful fix`);
+      const gitResult = await this.gitCommitAndPush(workingDirectory, result, commitmentId);
+      if (gitResult.committed) {
+        result.summary += ` | Git: committed${gitResult.pushed ? ', pushed to ' + gitResult.branch : ' (push failed)'}`;
+        if (gitResult.pushed && gitResult.branch) {
+          result.pr_url = `https://github.com/${gitResult.branch}`; // Placeholder - actual PR creation would require gh CLI
+        }
+      }
     }
 
-    // Step 5: Spawn Claude in terminal mode
-    // Claude will claim, fix, capture evidence, and close
-    console.log(`[BugExecutor] Spawning terminal executor in ${workingDirectory}`);
-    const result = await this.spawnTerminalExecutor(
-      workingDirectory,
-      commitmentId,
-      timeoutSeconds,
-      command.id,
-      command.workspace_id,
-      apiConfig
-    );
-
-    // Step 6: Store result in bridge_commands.result
+    // Step 6: Store result in bridge_commands.result (with verification)
     const { error: updateError } = await this.supabase
       .from("bridge_commands")
       .update({ result: { audit, execution: result } })
@@ -1072,166 +1135,11 @@ If you cannot fix within scope, output:
 
     if (updateError) {
       console.error(`[BugExecutor] Failed to store result for ${command.id}:`, updateError);
+      // Still return result, but log the failure
     } else {
       console.log(`[BugExecutor] Result stored for ${command.id}`);
     }
 
-    // NOTE: Bridge does NOT claim or close
-    // Claude is expected to do this via mentu CLI
     return result;
-  }
-
-  /**
-   * Build the prompt for the executor with API instructions.
-   * This provides both mentu CLI env vars AND curl fallback commands.
-   */
-  private buildExecutorPrompt(
-    commitmentId: string,
-    workspaceId: string,
-    apiConfig: { proxyUrl: string; apiKey: string }
-  ): string {
-    return `You are fixing a bug for commitment ${commitmentId}.
-
-Read .mentu/bug-context.md for full instructions.
-
-## Mentu API
-
-**Base URL**: ${apiConfig.proxyUrl}
-**Auth Header**: X-Proxy-Token: ${apiConfig.apiKey}
-
-### 1. Claim Commitment (FIRST)
-\`\`\`bash
-curl -X POST "${apiConfig.proxyUrl}/ops" \\
-  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"op": "claim", "commitment": "${commitmentId}", "actor": "agent:claude-vps"}'
-\`\`\`
-
-### 2. Fix the Bug
-Use Read, Edit, Bash, Grep, Glob tools as needed.
-
-### 3. Capture Evidence (After Fixing)
-\`\`\`bash
-curl -X POST "${apiConfig.proxyUrl}/ops" \\
-  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"op": "capture", "body": "Fixed: <summary of what you fixed>", "kind": "evidence", "workspace_id": "${workspaceId}", "actor": "agent:claude-vps"}'
-\`\`\`
-Returns: {"id": "mem_XXXXXXXX", ...}
-
-### 4. Close Commitment (LAST)
-\`\`\`bash
-curl -X POST "${apiConfig.proxyUrl}/ops" \\
-  -H "X-Proxy-Token: ${apiConfig.apiKey}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"op": "close", "commitment": "${commitmentId}", "evidence": "mem_XXXXXXXX", "actor": "agent:claude-vps"}'
-\`\`\`
-
-**Important**: You MUST capture evidence first, then use the returned mem_ID to close.
-
-When complete, output JSON:
-{"success": true, "summary": "what you did", "files_changed": ["file.ts"]}`;
-  }
-
-  /**
-   * Spawn Claude in terminal mode.
-   *
-   * Claude runs IN the workspace with full tool access and mentu CLI.
-   * Bridge's job is done after spawning - Claude handles claim/close.
-   *
-   * MENTU_* env vars are passed for CLI compatibility, and curl commands
-   * are included in the prompt as fallback for workspaces without .mentu.
-   */
-  private async spawnTerminalExecutor(
-    workingDirectory: string,
-    commitmentId: string,
-    timeoutSeconds: number,
-    commandId: string,
-    workspaceId: string,
-    apiConfig: { proxyUrl: string; apiKey: string }
-  ): Promise<ExecutionResult> {
-    return new Promise((resolve) => {
-      const prompt = this.buildExecutorPrompt(commitmentId, workspaceId, apiConfig);
-
-      console.log(`[BugExecutor] Spawning Claude in: ${workingDirectory}`);
-
-      const proc = spawn("claude", [
-        "--dangerously-skip-permissions",
-        "--max-turns", "50",
-        "-p", prompt
-      ], {
-        cwd: workingDirectory,
-        timeout: timeoutSeconds * 1000,
-        env: {
-          ...process.env,
-          MENTU_BRIDGE_COMMAND_ID: commandId,
-          // Mentu API configuration for CLI
-          MENTU_API_URL: apiConfig.proxyUrl,
-          MENTU_PROXY_TOKEN: apiConfig.apiKey,
-          MENTU_WORKSPACE_ID: workspaceId,
-          MENTU_ACTOR: 'agent:claude-vps',
-        }
-      });
-
-      let stdout = "";
-      let stderr = "";
-
-      proc.stdout.on("data", (data) => {
-        const chunk = data.toString();
-        stdout += chunk;
-        console.log(`[Executor] ${chunk.trim()}`);
-      });
-
-      proc.stderr.on("data", (data) => {
-        const chunk = data.toString();
-        stderr += chunk;
-        console.error(`[Executor:stderr] ${chunk.trim()}`);
-      });
-
-      proc.on("close", (code) => {
-        const exitCode = code ?? 1;
-        console.log(`[BugExecutor] Claude exited with code ${exitCode}`);
-
-        // Try to extract JSON result from output
-        const jsonMatch = stdout.match(/\{[\s\S]*?"success"[\s\S]*?\}/);
-        if (jsonMatch) {
-          try {
-            const parsed = JSON.parse(jsonMatch[0]);
-            resolve({
-              success: parsed.success ?? (exitCode === 0),
-              summary: parsed.summary ?? stdout.slice(-500),
-              files_changed: parsed.files_changed ?? [],
-              tests_passed: parsed.tests_passed ?? false,
-              exit_code: exitCode,
-              output: stdout
-            });
-            return;
-          } catch {
-            // Fall through to default
-          }
-        }
-
-        resolve({
-          success: exitCode === 0,
-          summary: stdout.slice(-1000) || stderr.slice(-500) || "No output",
-          files_changed: [],
-          tests_passed: false,
-          exit_code: exitCode,
-          output: stdout
-        });
-      });
-
-      proc.on("error", (err) => {
-        console.error(`[BugExecutor] Spawn error:`, err);
-        resolve({
-          success: false,
-          summary: `Spawn error: ${err.message}`,
-          files_changed: [],
-          tests_passed: false,
-          exit_code: 1,
-          output: stderr
-        });
-      });
-    });
   }
 }
