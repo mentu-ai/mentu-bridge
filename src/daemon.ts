@@ -14,7 +14,7 @@ import {
   isGitRepo,
   getWorktreePath,
 } from './worktree.js';
-import { BugExecutor } from './bug-executor.js';
+import { SimpleBugExecutor } from './simple-bug-executor.js';
 import { discoverWorkspaces, getWorkspaceDirectory } from './workspace-discovery.js';
 
 export class BridgeDaemon {
@@ -28,7 +28,7 @@ export class BridgeDaemon {
   private scheduler: CommitmentScheduler;
   private approvalHandler: ApprovalHandler;
   private enforcers: Map<string, GenesisEnforcer> = new Map();
-  private bugExecutor?: BugExecutor;
+  private bugExecutor?: SimpleBugExecutor;
   private workspaces: WorkspaceConfig[] = [];
   private processingCommands: Set<string> = new Set();  // Track in-flight commands
   private isReconnecting = false;  // Prevent cascading reconnects
@@ -187,24 +187,39 @@ export class BridgeDaemon {
     // Start commitment scheduler for due commitment polling
     this.scheduler.start();
 
-    // Start bug executor with discovered workspaces
+    // Start SimpleBugExecutor with discovered workspaces
     const machineId = process.env.MENTU_MACHINE_ID || this.config.machine.id;
 
     if (this.workspaces.length > 0) {
-      // Use service role client for BugExecutor if available (needed for operations table RLS)
+      // Use service role client for SimpleBugExecutor if available (needed for operations table RLS)
       const serviceRoleKey = this.config.supabase.serviceRoleKey || process.env.SUPABASE_SERVICE_ROLE_KEY;
       const bugExecutorClient = serviceRoleKey
         ? createClient(this.config.supabase.url, serviceRoleKey)
         : this.supabase;
 
       if (serviceRoleKey) {
-        this.log('[Daemon] BugExecutor using service role key (RLS bypass)');
+        this.log('[Daemon] SimpleBugExecutor using service role key (RLS bypass)');
       }
 
-      this.bugExecutor = new BugExecutor(bugExecutorClient, this.workspaces, machineId);
-      // Don't call start() - daemon routes bug_execution commands directly via executeBugCommand
-      // This avoids race conditions from dual polling
-      this.log('[Daemon] Bug executor created (daemon-routed mode)');
+      this.bugExecutor = new SimpleBugExecutor(
+        bugExecutorClient,
+        this.workspaces,
+        machineId,
+        {
+          proxyUrl: this.config.mentu.proxy_url,
+          apiKey: this.config.mentu.api_key,
+        },
+        {
+          pollIntervalMs: 30_000,
+          maxRetries: 3,
+          baseBackoffMs: 1000,
+          timeoutSeconds: this.config.execution.default_timeout_seconds,
+        }
+      );
+
+      // SimpleBugExecutor polls independently - start it
+      await this.bugExecutor.start();
+      this.log('[Daemon] SimpleBugExecutor started (polling mode)');
     } else {
       this.log('[Daemon] No workspaces, bug executor disabled');
     }
@@ -437,6 +452,13 @@ export class BridgeDaemon {
       return;
     }
 
+    // Skip bug_execution commands BEFORE claiming - SimpleBugExecutor handles them via independent polling
+    // This prevents handleCommand from claiming the command and leaving it stuck in 'claimed' status
+    if (command.command_type === 'bug_execution') {
+      this.log(`[handleCommand] Skipping ${command.id} - bug_execution handled by SimpleBugExecutor`);
+      return;
+    }
+
     // Attempt to claim (or verify already claimed by us)
     this.log(`[handleCommand] Attempting to claim ${command.id}...`);
     const claimed = await this.claimCommand(command.id);
@@ -474,7 +496,7 @@ export class BridgeDaemon {
       return;
     }
 
-    // Mentu: Capture task when claimed
+    // Mentu: Capture task when claimed (not for bug_execution - already captured by proxy)
     const taskMemory = await this.captureMemory(
       `Bridge Task [${command.agent}]: ${command.prompt}\n\nDirectory: ${command.working_directory}\nMachine: ${this.config.machine.name}`,
       'task'
@@ -484,26 +506,8 @@ export class BridgeDaemon {
       // Validate
       this.validateCommand(command);
 
-      // Route based on command_type
-      let result: ExecutionResult;
-
-      if (command.command_type === 'bug_execution' && this.bugExecutor) {
-        // Delegate bug_execution to BugExecutor (Auditor+Executor pattern)
-        this.log(`[handleCommand] Routing ${command.id} to BugExecutor (command_type: bug_execution)`);
-        const bugResult = await this.bugExecutor.executeBugCommand(command as any);
-        // Adapt BugExecutor result to daemon's ExecutionResult format
-        result = {
-          status: bugResult.success ? 'success' : 'failed',
-          exit_code: bugResult.exit_code,
-          stdout: bugResult.output || bugResult.summary,
-          stderr: bugResult.error || bugResult.blocked_reason || '',
-          error_message: bugResult.error || bugResult.blocked_reason,
-        };
-        this.log(`[handleCommand] BugExecutor completed: ${bugResult.success ? 'success' : 'failed'} - ${bugResult.summary?.slice(0, 100)}`);
-      } else {
-        // Standard execution
-        result = await this.executeCommand(command);
-      }
+      // Execute command
+      const result = await this.executeCommand(command);
 
       // Check if approval is required
       if (command.approval_required && result.status === 'success') {
