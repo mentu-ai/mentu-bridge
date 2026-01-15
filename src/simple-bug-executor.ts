@@ -12,7 +12,12 @@
 import { SupabaseClient } from "@supabase/supabase-js";
 import { spawn, ChildProcess, exec } from "child_process";
 import * as crypto from "crypto";
+import * as fs from "fs";
+import * as path from "path";
 import type { WorkspaceConfig } from "./types.js";
+
+// Execution log directory
+const EXECUTION_LOG_DIR = process.env.EXECUTION_LOG_DIR || '/home/mentu/logs/executions';
 
 // ============================================================================
 // Types
@@ -24,6 +29,7 @@ export interface SimpleBugExecutorConfig {
   baseBackoffMs?: number;       // Default: 1000 (1s)
   timeoutSeconds?: number;      // Default: 3600 (1 hour)
   staleThresholdMinutes?: number;  // Default: 30
+  maxTurns?: number;            // Default: 50 (configurable)
 }
 
 export interface BugCommand {
@@ -117,6 +123,7 @@ export class SimpleBugExecutor {
   private readonly BASE_BACKOFF_MS: number;
   private readonly TIMEOUT_SECONDS: number;
   private readonly STALE_THRESHOLD_MINUTES: number;
+  private readonly MAX_TURNS: number;
 
   constructor(
     supabase: SupabaseClient,
@@ -137,6 +144,7 @@ export class SimpleBugExecutor {
     this.BASE_BACKOFF_MS = config.baseBackoffMs ?? 1000;
     this.TIMEOUT_SECONDS = config.timeoutSeconds ?? 3600;
     this.STALE_THRESHOLD_MINUTES = config.staleThresholdMinutes ?? 30;
+    this.MAX_TURNS = config.maxTurns ?? 50;
   }
 
   // --------------------------------------------------------------------------
@@ -315,6 +323,31 @@ export class SimpleBugExecutor {
     return (data?.length ?? 0) > 0;
   }
 
+  /**
+   * Claim the commitment via mentu CLI (proper ledger operation)
+   * This shows the commitment as "in progress" in the dashboard
+   */
+  private async claimCommitment(commitmentId: string): Promise<void> {
+    this.log(`Claiming commitment ${commitmentId}`);
+
+    return new Promise((resolve) => {
+      // Use mentu claim command to properly record in ledger
+      exec(
+        `mentu claim ${commitmentId} --actor agent:claude-vps`,
+        { timeout: 30000 },
+        (error, stdout, stderr) => {
+          if (error) {
+            this.log(`Warning: Could not claim commitment: ${stderr || error.message}`);
+            // Don't throw - continue with execution even if claim fails
+          } else {
+            this.log(`Commitment ${commitmentId} claimed via ledger`);
+          }
+          resolve();
+        }
+      );
+    });
+  }
+
   // --------------------------------------------------------------------------
   // Bug Execution (Single Agent)
   // --------------------------------------------------------------------------
@@ -334,7 +367,7 @@ export class SimpleBugExecutor {
       throw new Error('Bug execution requires commitment_id');
     }
 
-    // Update status to running
+    // Update bridge_commands status
     await this.supabase
       .from('bridge_commands')
       .update({
@@ -343,35 +376,44 @@ export class SimpleBugExecutor {
       })
       .eq('id', command.id);
 
+    // Claim the commitment (move to 'claimed' state)
+    await this.claimCommitment(commitmentId);
+
+    // Record to ledger (v2.0 prep)
+    const executionStartId = await this.recordExecutionStart(
+      commitmentId,
+      workingDirectory,
+      command.id
+    );
+
     // Capture starting git ref for verification
     const startRef = await this.getHeadRef(workingDirectory);
     this.log(`Starting ref: ${startRef}`);
 
-    // Fetch bug memory
+    // Fetch bug memory for description
     this.log(`Fetching bug memory ${memoryId}`);
     const bugMemory = await this.fetchBugMemory(command.workspace_id, memoryId);
     if (!bugMemory) {
       throw new Error(`Bug memory ${memoryId} not found`);
     }
 
-    // Build unified prompt (single agent - no auditor phase)
-    const prompt = this.buildUnifiedBugPrompt(
-      bugMemory,
-      commitmentId,
-      workingDirectory,
-      command.workspace_id
-    );
+    // Extract bug description
+    const bugDescription = this.extractBugDescription(bugMemory);
 
-    // Spawn Claude via stdin (NOT -p flag)
-    this.log(`Spawning Claude in ${workingDirectory} (timeout: ${timeoutSeconds}s)`);
-    const claudeResult = await this.spawnTerminalClaude(
+    // Build minimal prompt (delegates to repo's protocol file)
+    const prompt = this.buildMinimalPrompt(bugDescription, commitmentId, memoryId);
+
+    // Spawn Claude with CLI argument (not stdin)
+    this.log(`Spawning Claude in ${workingDirectory} (max turns: ${this.MAX_TURNS}, timeout: ${timeoutSeconds}s)`);
+    const claudeResult = await this.spawnClaudeWithArg(
       workingDirectory,
       prompt,
       timeoutSeconds,
-      command.id
+      command.id,
+      commitmentId
     );
 
-    // Verify outcomes - check git commits and ledger state
+    // Verify outcomes
     const verification = await this.verifyOutcome(
       workingDirectory,
       commitmentId,
@@ -379,8 +421,7 @@ export class SimpleBugExecutor {
       { success: claudeResult.success, blocked_reason: claudeResult.blocked_reason }
     );
 
-    // Return result with verification data
-    return {
+    const finalResult: BugFixResult = {
       ...claudeResult,
       verified: verification.verified,
       files_changed: verification.filesChanged.length > 0
@@ -388,6 +429,11 @@ export class SimpleBugExecutor {
         : claudeResult.files_changed,
       verification,
     };
+
+    // Record completion to ledger (v2.0 prep)
+    await this.recordExecutionComplete(executionStartId, commitmentId, finalResult);
+
+    return finalResult;
   }
 
   private async fetchBugMemory(workspaceId: string, memoryId: string): Promise<BugMemory | null> {
@@ -407,191 +453,107 @@ export class SimpleBugExecutor {
   }
 
   // --------------------------------------------------------------------------
-  // Unified Bug Prompt (No Auditor Phase)
+  // Minimal Bug Prompt (Delegates to BUG-FIX-PROTOCOL.md)
   // --------------------------------------------------------------------------
 
-  private buildUnifiedBugPrompt(
-    bugMemory: BugMemory,
+  /**
+   * Build minimal prompt that delegates to repo's BUG-FIX-PROTOCOL.md
+   *
+   * v1.0: Minimal prompt, repo owns instructions
+   * v2.0: Will add worktree path, session tracking
+   */
+  private buildMinimalPrompt(
+    bugDescription: string,
     commitmentId: string,
-    workingDirectory: string,
-    _workspaceId: string
+    memoryId: string
   ): string {
-    const bugInfo = this.extractBugInfo(bugMemory);
+    return `Fix this bug (commitment: ${commitmentId}):
+${bugDescription}
 
-    // Format console errors
-    const consoleErrorsText = bugInfo.consoleErrors
-      ?.map(e => `- [${e.level}] ${e.message}`)
-      .join('\n') || 'None recorded';
-
-    // Format behavior trace
-    const behaviorText = bugInfo.behaviorTrace
-      ?.slice(-10)
-      .map(a => `- ${a.type}: ${a.target || ''}`)
-      .join('\n') || 'Not recorded';
-
-    return `# Bug Fix Task
-
-You are fixing a bug. Your job is to:
-1. **Analyze** the bug to understand the root cause
-2. **Implement** a focused fix
-3. **Verify** the fix works
-4. **Close** the commitment with evidence
-
-## Bug Report
-
-**Description**: ${bugInfo.description}
-
-**Page URL**: ${bugInfo.pageUrl || 'Not provided'}
-**Element**: ${bugInfo.elementText || 'Not specified'}
-**Screenshot**: ${bugInfo.screenshotUrl || 'None'}
-
-## Console Errors
-${consoleErrorsText}
-
-## User Behavior (last 10 actions)
-${behaviorText}
-
----
-
-## Your Process
-
-### Phase 1: Analysis
-Before touching any code:
-- Search for relevant files using Grep/Glob
-- Read the likely affected code
-- Form a hypothesis about the root cause
-- Identify which files need changes (max 5 files)
-
-### Phase 2: Implementation
-- Make minimal, focused changes
-- Do NOT modify: package.json, *.lock, *.config.*, test fixtures
-- Keep changes to the identified files only
-
-### Phase 3: Verification
-Run appropriate checks:
-- TypeScript: npx tsc --noEmit
-- Tests: npm test (if test files exist for changed code)
-- Build: npm run build (if build script exists)
-
-### Phase 4: Closure
-When complete, you MUST:
-
-1. **Commit your changes** (if any files were modified):
-\`\`\`bash
-git add -A
-git commit -m "fix: <brief description of fix>
-
-Fixes bug: ${bugInfo.description.slice(0, 50)}..."
-git push origin HEAD
-\`\`\`
-
-2. **Capture evidence** (run from ${workingDirectory}):
-\`\`\`bash
-mentu capture "Fixed: <your summary here>" --kind evidence --actor agent:claude-vps
-\`\`\`
-This outputs a memory ID like mem_XXXXXXXX. Copy that ID.
-
-3. **Close commitment** (use the mem_ID from above):
-\`\`\`bash
-mentu close ${commitmentId} --evidence mem_XXXXXXXX --actor agent:claude-vps
-\`\`\`
-
-**IMPORTANT**: The mentu commands write to the LOCAL ledger at .mentu/ledger.jsonl.
-This is how we verify your work was actually done.
-
----
-
-## Constraints
-
-- Maximum 5 files changed
-- Do NOT add new dependencies
-- Do NOT modify configuration files
-- If you cannot fix within scope, capture a "blocked" memory and stop
-
-## Working Directory
-
-${workingDirectory}
-
-## Commitment ID
-
-${commitmentId}
-
----
-
-## Output
-
-When complete, output this JSON on its own line:
-{
-  "success": true,
-  "summary": "Brief description of what was fixed",
-  "files_changed": ["path/to/file1.ts"],
-  "tests_passed": true
-}
-
-If blocked, output:
-{
-  "success": false,
-  "summary": "Why fix could not be completed",
-  "blocked_reason": "Specific blocker",
-  "files_changed": []
-}
-
----
-
-Begin by searching for code related to the bug description.`;
+Full instructions: Read ./BUG-FIX-PROTOCOL.md
+Bug details available as memory: ${memoryId}`;
   }
 
-  private extractBugInfo(memory: BugMemory): {
-    description: string;
-    pageUrl?: string;
-    elementText?: string;
-    screenshotUrl?: string;
-    consoleErrors?: Array<{ level: string; message: string }>;
-    behaviorTrace?: Array<{ type: string; target?: string }>;
-  } {
+  /**
+   * Extract bug description from memory payload
+   */
+  private extractBugDescription(memory: BugMemory): string {
     const payload = memory.payload || {};
     const body = (payload.body as string) || '';
-    const meta = payload.meta || {};
 
-    // Extract first paragraph as description (before --- separator)
+    // Extract first paragraph (before --- separator) as description
     const description = body.split('---')[0]?.trim().slice(0, 800) || body.slice(0, 800);
 
-    return {
-      description,
-      pageUrl: meta.page_url as string | undefined,
-      elementText: meta.element_text as string | undefined,
-      screenshotUrl: meta.screenshot_url as string | undefined,
-      consoleErrors: meta.console_errors as Array<{ level: string; message: string }> | undefined,
-      behaviorTrace: meta.behavior_trace as Array<{ type: string; target?: string }> | undefined,
-    };
+    return description || 'Bug details in memory';
   }
 
   // --------------------------------------------------------------------------
-  // Terminal Claude Spawn (via stdin, NOT -p flag)
+  // Claude Spawn with CLI Argument (v1.0 - NOT stdin)
   // --------------------------------------------------------------------------
 
-  private async spawnTerminalClaude(
+  /**
+   * Spawn Claude with prompt as CLI argument (not stdin)
+   *
+   * v1.0: CLI argument spawn pattern
+   * v1.1: Added execution log file for lineage tracking
+   * v2.0: Will add tmux session tracking
+   */
+  private async spawnClaudeWithArg(
     workingDirectory: string,
     prompt: string,
     timeoutSeconds: number,
-    commandId: string
+    commandId: string,
+    commitmentId: string
   ): Promise<BugFixResult> {
     return new Promise((resolve) => {
-      this.log(`Spawning claude in terminal mode`);
+      this.log(`[v1.1] Spawning claude with CLI arg in ${workingDirectory}`);
 
+      // Create execution log file for lineage
+      let logStream: fs.WriteStream | null = null;
+      const logPath = path.join(EXECUTION_LOG_DIR, `${commandId}.log`);
+
+      try {
+        // Ensure log directory exists
+        fs.mkdirSync(EXECUTION_LOG_DIR, { recursive: true });
+        logStream = fs.createWriteStream(logPath, { flags: 'a' });
+
+        // Write execution header
+        const header = [
+          '================================================================================',
+          `EXECUTION LOG: ${commandId}`,
+          `Commitment: ${commitmentId}`,
+          `Started: ${new Date().toISOString()}`,
+          `Working Directory: ${workingDirectory}`,
+          `Timeout: ${timeoutSeconds}s`,
+          '================================================================================',
+          '',
+          '--- PROMPT ---',
+          prompt,
+          '',
+          '--- OUTPUT ---',
+          ''
+        ].join('\n');
+        logStream.write(header);
+        this.log(`Execution log: ${logPath}`);
+      } catch (err) {
+        this.log(`Warning: Could not create execution log: ${(err as Error).message}`);
+      }
+
+      // NEW: Pass prompt as positional argument, NOT via stdin
       const proc = spawn('claude', [
         '--dangerously-skip-permissions',
-        '--max-turns', '30',
+        '--max-turns', this.MAX_TURNS.toString(),
+        prompt,  // ← Prompt as CLI argument
       ], {
         cwd: workingDirectory,
-        stdio: ['pipe', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe'],  // stdin ignored (no piping)
         env: {
           ...process.env,
           MENTU_BRIDGE_COMMAND_ID: commandId,
+          MENTU_COMMITMENT: commitmentId,
           MENTU_API_URL: this.apiConfig.proxyUrl,
           MENTU_PROXY_TOKEN: this.apiConfig.apiKey,
           MENTU_ACTOR: 'agent:claude-vps',
-          // Ensure OAuth token is passed
           ...(process.env.CLAUDE_CODE_OAUTH_TOKEN && {
             CLAUDE_CODE_OAUTH_TOKEN: process.env.CLAUDE_CODE_OAUTH_TOKEN,
           }),
@@ -600,18 +562,14 @@ Begin by searching for code related to the bug description.`;
 
       this.currentProcess = proc;
 
-      // Pipe prompt to stdin
-      proc.stdin.write(prompt);
-      proc.stdin.end();
-
       let stdout = '';
       let stderr = '';
       let timedOut = false;
 
-      // Timeout handler
       const timeoutHandle = setTimeout(() => {
         timedOut = true;
         this.log(`Command timed out after ${timeoutSeconds}s`);
+        logStream?.write('\n--- TIMEOUT ---\n');
         proc.kill('SIGTERM');
         setTimeout(() => {
           if (this.currentProcess === proc) {
@@ -623,14 +581,18 @@ Begin by searching for code related to the bug description.`;
       proc.stdout.on('data', (data) => {
         const chunk = data.toString();
         stdout += chunk;
-        // Log progress every 2KB
-        if (stdout.length % 2000 < chunk.length) {
+        // Stream to log file
+        logStream?.write(chunk);
+        if (stdout.length % 5000 < chunk.length) {
           this.log(`Output: ${stdout.length} bytes`);
         }
       });
 
       proc.stderr.on('data', (data) => {
-        stderr += data.toString();
+        const chunk = data.toString();
+        stderr += chunk;
+        // Stream stderr to log file with prefix
+        logStream?.write(`[stderr] ${chunk}`);
       });
 
       proc.on('close', (code) => {
@@ -640,30 +602,23 @@ Begin by searching for code related to the bug description.`;
         const exitCode = code ?? 1;
         this.log(`Claude exited with code ${exitCode}${timedOut ? ' (timeout)' : ''}`);
 
-        // Try to extract JSON result from output
-        const jsonMatch = stdout.match(/\{[\s\S]*?"success"[\s\S]*?\}/);
-        if (jsonMatch) {
-          try {
-            const parsed = JSON.parse(jsonMatch[0]);
-            resolve({
-              success: parsed.success ?? (exitCode === 0),
-              verified: false,  // Will be set by verifyOutcome
-              summary: parsed.summary ?? stdout.slice(-500),
-              files_changed: parsed.files_changed ?? [],
-              tests_passed: parsed.tests_passed ?? false,
-              blocked_reason: parsed.blocked_reason,
-              exit_code: exitCode,
-              output: stdout.slice(-10000),
-            });
-            return;
-          } catch {
-            // Fall through to default
-          }
+        // Write footer and close log
+        if (logStream) {
+          const footer = [
+            '',
+            '--- END ---',
+            `Completed: ${new Date().toISOString()}`,
+            `Exit Code: ${exitCode}`,
+            `Status: ${timedOut ? 'TIMEOUT' : (exitCode === 0 ? 'SUCCESS' : 'FAILED')}`,
+            '================================================================================'
+          ].join('\n');
+          logStream.write(footer);
+          logStream.end();
         }
 
         resolve({
           success: !timedOut && exitCode === 0,
-          verified: false,  // Will be set by verifyOutcome
+          verified: false,
           summary: timedOut
             ? `Timed out after ${timeoutSeconds}s`
             : stdout.slice(-1000) || stderr.slice(-500) || 'No output',
@@ -680,9 +635,16 @@ Begin by searching for code related to the bug description.`;
         this.currentProcess = null;
 
         this.log(`Spawn error: ${err.message}`);
+
+        // Close log file on error
+        if (logStream) {
+          logStream.write(`\n--- ERROR ---\n${err.message}\n`);
+          logStream.end();
+        }
+
         resolve({
           success: false,
-          verified: false,  // Will be set by verifyOutcome
+          verified: false,
           summary: `Spawn error: ${err.message}`,
           files_changed: [],
           tests_passed: false,
@@ -692,6 +654,98 @@ Begin by searching for code related to the bug description.`;
         });
       });
     });
+  }
+
+  // --------------------------------------------------------------------------
+  // Ledger Recording (v2.0 Prep)
+  // --------------------------------------------------------------------------
+
+  /**
+   * Record execution_start to ledger via mentu capture
+   *
+   * v1.0: Records for audit trail
+   * v2.0: This becomes the dispatch mechanism (instead of bridge_commands)
+   */
+  private async recordExecutionStart(
+    commitmentId: string,
+    workingDirectory: string,
+    commandId: string
+  ): Promise<string | null> {
+    try {
+      const response = await fetch(`${this.apiConfig.proxyUrl}/ops`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Proxy-Token': this.apiConfig.apiKey,
+        },
+        body: JSON.stringify({
+          op: 'capture',
+          body: `Bug execution starting for ${commitmentId}`,
+          kind: 'execution_start',
+          actor: 'agent:bridge-executor',
+          meta: {
+            commitment_id: commitmentId,
+            working_directory: workingDirectory,
+            bridge_command_id: commandId,
+            state: 'starting',
+            max_turns: this.MAX_TURNS,
+            // v2.0 will add: tmux_session, worktree_path
+          },
+        }),
+      });
+
+      if (!response.ok) {
+        this.log(`[Ledger] execution_start capture failed: ${await response.text()}`);
+        return null;
+      }
+
+      const result = await response.json() as { id: string };
+      this.log(`[Ledger] Recorded execution_start: ${result.id}`);
+      return result.id;
+
+    } catch (err) {
+      this.log(`[Ledger] execution_start error: ${err instanceof Error ? err.message : String(err)}`);
+      return null;  // Non-fatal: continue execution even if ledger fails
+    }
+  }
+
+  /**
+   * Record execution completion to ledger
+   */
+  private async recordExecutionComplete(
+    executionStartId: string | null,
+    commitmentId: string,
+    result: BugFixResult
+  ): Promise<void> {
+    if (!executionStartId) return;
+
+    try {
+      await fetch(`${this.apiConfig.proxyUrl}/ops`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Proxy-Token': this.apiConfig.apiKey,
+        },
+        body: JSON.stringify({
+          op: 'annotate',
+          target: executionStartId,
+          body: result.success
+            ? `Execution completed successfully: ${result.summary.slice(0, 200)}`
+            : `Execution failed: ${result.blocked_reason || result.summary.slice(0, 200)}`,
+          actor: 'agent:bridge-executor',
+          meta: {
+            state: result.verified ? 'verified' : (result.success ? 'completed' : 'failed'),
+            exit_code: result.exit_code,
+            files_changed: result.files_changed,
+            verified: result.verified,
+          },
+        }),
+      });
+
+      this.log(`[Ledger] Recorded execution completion for ${commitmentId}`);
+    } catch (err) {
+      this.log(`[Ledger] completion annotation error: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -730,9 +784,79 @@ Begin by searching for code related to the bug description.`;
     this.log(`Completed ${commandId} - verified: ${result.verified}, success: ${actualSuccess}`);
     this.log(`Verification reason: ${result.verification?.reason}`);
 
+    // Close commitment if verified successful (via Supabase, not local ledger)
+    if (actualSuccess && commitmentId) {
+      await this.closeCommitment(commitmentId, command.workspace_id, result);
+    }
+
     // Trigger callback if configured
     if (commitmentId) {
       await this.triggerCallback(command, commitmentId, result);
+    }
+  }
+
+  /**
+   * Close the commitment via Supabase after successful execution
+   * This handles the case where commitment is in Supabase but not local ledger
+   */
+  private async closeCommitment(
+    commitmentId: string,
+    workspaceId: string,
+    result: BugFixResult
+  ): Promise<void> {
+    this.log(`Closing commitment ${commitmentId} via Supabase`);
+
+    try {
+      // First capture evidence memory
+      const evidenceId = `mem_${crypto.randomBytes(4).toString('hex')}`;
+      const evidenceBody = `Bug fix verified: ${result.summary?.slice(0, 500) || 'No summary'}
+Files changed: ${result.files_changed?.join(', ') || 'None'}
+Git commits: ${result.verification?.gitCommits || 0}
+Pushed: ${result.verification?.pushedToRemote ? 'Yes' : 'No'}`;
+
+      // Create evidence memory operation
+      await this.supabase.from('operations').insert({
+        id: evidenceId,
+        workspace_id: workspaceId,
+        op: 'capture',
+        ts: new Date().toISOString(),
+        actor: 'agent:claude-vps',
+        payload: {
+          body: evidenceBody,
+          kind: 'evidence',
+        },
+      });
+
+      // Create close operation
+      const closeOpId = `op_${crypto.randomBytes(4).toString('hex')}`;
+      await this.supabase.from('operations').insert({
+        id: closeOpId,
+        workspace_id: workspaceId,
+        op: 'close',
+        ts: new Date().toISOString(),
+        actor: 'agent:claude-vps',
+        payload: {
+          commitment: commitmentId,
+          evidence: evidenceId,
+        },
+      });
+
+      // Update commitments table
+      await this.supabase
+        .from('commitments')
+        .update({
+          state: 'closed',
+          evidence: evidenceId,
+          closed_by: 'agent:claude-vps',
+          closed_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', commitmentId);
+
+      this.log(`Commitment ${commitmentId} closed with evidence ${evidenceId}`);
+    } catch (err) {
+      this.log(`Warning: Failed to close commitment: ${(err as Error).message}`);
+      // Don't throw - execution was successful even if close fails
     }
   }
 
