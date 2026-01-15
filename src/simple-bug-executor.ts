@@ -330,10 +330,13 @@ export class SimpleBugExecutor {
   private async claimCommitment(commitmentId: string): Promise<void> {
     this.log(`Claiming commitment ${commitmentId}`);
 
+    // Use full path for mentu CLI (systemd doesn't inherit PATH reliably)
+    const mentuPath = process.env.MENTU_CLI_PATH || '/home/mentu/.npm-global/bin/mentu';
+
     return new Promise((resolve) => {
       // Use mentu claim command to properly record in ledger
       exec(
-        `mentu claim ${commitmentId} --actor agent:claude-vps`,
+        `${mentuPath} claim ${commitmentId} --actor agent:claude-vps`,
         { timeout: 30000 },
         (error, stdout, stderr) => {
           if (error) {
