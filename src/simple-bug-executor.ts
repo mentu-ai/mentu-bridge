@@ -467,11 +467,60 @@ export class SimpleBugExecutor {
     commitmentId: string,
     memoryId: string
   ): string {
-    return `Fix this bug (commitment: ${commitmentId}):
+    return `You are an autonomous bug fixer. Fix this bug NOW using tools.
+
+COMMITMENT: ${commitmentId}
+MEMORY: ${memoryId}
+
+## STEP 0: READ CONTEXT (MANDATORY - DO THIS FIRST)
+Before anything else, read these files to understand the project:
+- Read: ./CLAUDE.md (project instructions)
+- Read: ./.mentu/manifest.yaml (project identity)
+- Read: ./README.md (project overview)
+- Read: ./BUG-FIX-PROTOCOL.md (full bug fix instructions)
+
+## BUG DESCRIPTION
 ${bugDescription}
 
-Full instructions: Read ./BUG-FIX-PROTOCOL.md
-Bug details available as memory: ${memoryId}`;
+## REQUIRED ACTIONS (do ALL of these IN ORDER)
+1. READ CONTEXT FILES (step 0 above) - understand the project first
+2. INVESTIGATE: Use Grep/Read to find the bug location
+3. FIX: Use Edit tool to modify the actual source files
+4. BUILD: Run \`npm run build\` to verify no errors AND regenerate CSS
+5. COMMIT: git add -A && git commit -m "fix: <description>" && git push
+6. VERIFY DEPLOYMENT: Wait for Vercel to deploy and confirm fix is LIVE
+
+## STEP 6: VERIFY DEPLOYMENT (CRITICAL - DO NOT SKIP)
+After pushing, poll Vercel deployment status until READY:
+\`\`\`bash
+# Check deployment status (poll every 15s until state="READY")
+curl -s -H "Authorization: Bearer $VERCEL_TOKEN" \\
+  "https://api.vercel.com/v6/deployments?projectId=prj_ognQmctRqQKNJJl6V3M4nZuWfbkE&limit=1" \\
+  | jq '.deployments[0] | {state, url}'
+\`\`\`
+States: QUEUED → BUILDING → READY (or ERROR)
+- If ERROR: check build logs and fix
+- If READY: verify on production URL that the fix is actually visible
+- DO NOT exit until deployment is READY and verified
+
+## CRITICAL RULES
+- You MUST use the Edit tool to modify files - not describe what you would do
+- You MUST run the full build (npm run build) - not just tsc
+- You MUST commit and push - the executor verifies git commits
+- You MUST wait for Vercel deployment and verify it's live
+- For CSS/Tailwind changes: the build MUST run to generate new CSS classes
+- Do NOT exit until changes are DEPLOYED and VERIFIED on production
+
+## ANTI-HALLUCINATION CHECK
+Before exiting, verify you actually:
+[ ] Used Edit tool (not just described changes)
+[ ] Ran npm run build (not just tsc)
+[ ] Ran git commit (not just git add)
+[ ] Ran git push (not just commit)
+[ ] Waited for Vercel deployment state="READY"
+[ ] Verified fix is visible on production URL
+
+If you only described changes without using tools, START OVER.`;
   }
 
   /**
@@ -542,6 +591,7 @@ Bug details available as memory: ${memoryId}`;
       // NEW: Pass prompt as positional argument, NOT via stdin
       const proc = spawn('claude', [
         '--dangerously-skip-permissions',
+        '--model', 'claude-opus-4-5-20251101',  // Opus 4.5 for best reasoning
         '--max-turns', this.MAX_TURNS.toString(),
         prompt,  // ← Prompt as CLI argument
       ], {
